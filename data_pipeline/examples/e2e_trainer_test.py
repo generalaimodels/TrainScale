@@ -581,13 +581,32 @@ def main() -> int:
             if scaler:
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                grad_info = clip_grad_norm_(model.parameters(), max_norm=train_cfg.max_grad_norm)
+                
+                # Clip gradients (allow inf, scaler will handle)
+                grad_info = clip_grad_norm_(
+                    model.parameters(), 
+                    max_norm=train_cfg.max_grad_norm,
+                    error_if_nonfinite=False,  # Let scaler handle overflow
+                )
+                
+                # Check for overflow - scaler will skip step if inf
                 scaler.step(optimizer)
                 scaler.update()
+                
+                # If overflow, skip this step's metrics
+                if grad_info.overflow:
+                    continue
             else:
                 loss.backward()
-                grad_info = clip_grad_norm_(model.parameters(), max_norm=train_cfg.max_grad_norm)
-                optimizer.step()
+                grad_info = clip_grad_norm_(
+                    model.parameters(), 
+                    max_norm=train_cfg.max_grad_norm,
+                    error_if_nonfinite=False,
+                )
+                if not grad_info.overflow:
+                    optimizer.step()
+                else:
+                    continue  # Skip step on overflow
             
             scheduler.step()
             
