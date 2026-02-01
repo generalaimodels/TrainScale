@@ -225,8 +225,8 @@ def get_autocast_context(device: torch.device, config: TrainingConfig):
     """Get autocast context for AMP."""
     if device.type == "cuda" and (config.fp16 or config.bf16):
         dtype = torch.bfloat16 if config.bf16 else torch.float16
-        return torch.cuda.amp.autocast(dtype=dtype)
-    return torch.cuda.amp.autocast(enabled=False)
+        return torch.amp.autocast(device_type="cuda", dtype=dtype)
+    return torch.amp.autocast(device_type="cuda", enabled=False)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════════
@@ -469,9 +469,20 @@ def main() -> int:
     
     from transformers import AutoModelForCausalLM
     
+    # IMPORTANT: When using fp16 AMP with GradScaler, model must be in fp32
+    # Only bf16 can be used natively without scaler
+    if train_cfg.fp16:
+        # fp16 AMP: load in fp32, autocast handles fp16 forward
+        model_dtype = torch.float32
+    elif train_cfg.bf16:
+        # bf16: can load natively, no scaler needed
+        model_dtype = torch.bfloat16
+    else:
+        model_dtype = torch.float32
+    
     model = AutoModelForCausalLM.from_pretrained(
         train_cfg.model_name,
-        torch_dtype=compute_dtype,
+        torch_dtype=model_dtype,
         low_cpu_mem_usage=True,
     )
     model = model.to(device)
@@ -514,10 +525,10 @@ def main() -> int:
     sched_cls = sched_map.get(train_cfg.scheduler_type.lower(), CosineScheduler)
     scheduler = sched_cls(optimizer, num_training_steps=total_steps, warmup_steps=warmup_steps)
     
-    # GradScaler for AMP
+    # GradScaler for fp16 AMP only (bf16 doesn't need it)
     scaler = None
     if device.type == "cuda" and train_cfg.fp16:
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler("cuda")
     
     print(f"   ✓ Optimizer: {type(optimizer).__name__}")
     print(f"   ✓ Scheduler: {type(scheduler).__name__}")
