@@ -391,39 +391,46 @@ def main() -> int:
     # ──────────────────────────────────────────────────────────────────────────
     print("\n⚙️  Step 4: Setting up preprocessing pipeline...")
     
+    from data_pipeline.core.config_schema import PromptTemplate
     from data_pipeline.preprocessing import (
         PromptEngine,
-        TemplateConfig,
-        TemplateType,
-        PreprocessedDataset,
+        wrap_tokenizer,
         create_length_manager,
         create_dynamic_collate_fn,
         PaddingStrategy,
     )
+    from data_pipeline.data.dataset_wrappers import PreprocessedDataset
     
-    template_config = TemplateConfig(
-        template_type=TemplateType.CUSTOM,
-        custom_template=data_cfg.template,
+    # Wrap tokenizer for PromptEngine compatibility
+    tokenizer_wrapper = wrap_tokenizer(tokenizer)
+    
+    # Create prompt template
+    prompt_template = PromptTemplate(
+        format_type="custom",
+        template=data_cfg.template,
         input_columns=data_cfg.input_columns,
         label_column=data_cfg.label_column,
         mask_input=data_cfg.mask_input,
+        add_bos=False,
+        add_eos=True,
     )
-    
-    prompt_engine = PromptEngine(
-        tokenizer=tokenizer,
-        template_config=template_config,
-        max_length=data_cfg.max_length,
-        eos_token=tokenizer.eos_token,
-    )
-    
-    train_preprocessed = PreprocessedDataset(train_dataset, prompt_engine)
-    eval_preprocessed = PreprocessedDataset(eval_dataset, prompt_engine)
     
     # LengthManager with strict MAX_LENGTH truncation
     length_manager = create_length_manager(
         max_length=data_cfg.max_length,
         padding_strategy=PaddingStrategy.MAX_LENGTH,
     )
+    
+    # Create PromptEngine
+    prompt_engine = PromptEngine(
+        template=prompt_template,
+        tokenizer=tokenizer_wrapper,
+        length_manager=length_manager,
+        max_length=data_cfg.max_length,
+    )
+    
+    train_preprocessed = PreprocessedDataset(train_dataset, prompt_engine)
+    eval_preprocessed = PreprocessedDataset(eval_dataset, prompt_engine)
     
     collate_fn = create_dynamic_collate_fn(
         length_manager=length_manager,
