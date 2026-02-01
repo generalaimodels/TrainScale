@@ -487,6 +487,11 @@ def main() -> int:
     )
     model = model.to(device)
     
+    # Enable gradient checkpointing for memory efficiency
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        print("   ✓ Gradient Checkpointing: Enabled")
+    
     param_count = sum(p.numel() for p in model.parameters())
     trainable_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     

@@ -39,7 +39,7 @@ dataset:
 # ─────────────────────────────────────────────────────────────────────────────────
 tokenizer:
   name_or_path: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # Match model
-  max_length: 1024  # TinyLlama supports 2048, use 1024 for memory
+  max_length: 512  # Reduced for T4 GPU memory
   padding: "longest"
   truncation: true
   add_special_tokens: true
@@ -105,7 +105,7 @@ output_schema:
 # DataLoader Configuration
 # ─────────────────────────────────────────────────────────────────────────────────
 dataloader:
-  batch_size: 4  # Adjust based on GPU memory
+  batch_size: 2  # Reduced for T4 GPU (15GB VRAM)
   shuffle: true
   num_workers: 2
   pin_memory: true  # Faster GPU transfer
