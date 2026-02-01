@@ -614,6 +614,18 @@ def get_linear_schedule_with_warmup(
         min_lr_ratio=0.0,
     )
 
+# SOTA Schedulers (Above Unsloth)
+from data_pipeline.trainer.schedulers.sota_schedulers import (
+    BaseEnhancedScheduler,
+    WSDScheduler,
+    REXScheduler,
+    OneCycleScheduler as OneCycleSchedulerEnhanced,
+    PolynomialDecayScheduler,
+    InverseSquareRootScheduler,
+    CosineRestartScheduler,
+    create_scheduler as create_sota_scheduler,
+)
+
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # Export
@@ -635,4 +647,14 @@ __all__ = [
     # Convenience
     "get_cosine_schedule_with_warmup",
     "get_linear_schedule_with_warmup",
+    # SOTA (Above Unsloth)
+    "BaseEnhancedScheduler",
+    "WSDScheduler",
+    "REXScheduler",
+    "OneCycleSchedulerEnhanced",
+    "PolynomialDecayScheduler",
+    "InverseSquareRootScheduler",
+    "CosineRestartScheduler",
+    "create_sota_scheduler",
 ]
+

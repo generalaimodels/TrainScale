@@ -273,7 +273,6 @@ def compile_model(
         logger.warning(f"torch.compile failed: {e}, using eager mode")
         return model
 
-
 # Import flash attention
 from data_pipeline.trainer.kernels.flash_attention import (
     is_flash_attn_available,
@@ -284,8 +283,98 @@ from data_pipeline.trainer.kernels.flash_attention import (
     MultiHeadFlashAttention,
 )
 
+# Import SOTA Triton kernels
+from data_pipeline.trainer.kernels.triton_kernels import (
+    Fast_CrossEntropyLoss,
+    fast_cross_entropy_loss,
+    Fast_RMS_LayerNorm,
+    fast_rms_layernorm,
+    swiglu_forward,
+    swiglu_backward,
+    geglu_forward,
+    apply_rope,
+    precompute_freqs_cis,
+    MAX_FUSED_SIZE,
+    calculate_settings,
+)
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# NEW: Above-Unsloth SOTA Kernels
+# ═════════════════════════════════════════════════════════════════════════════════
+
+# FP8 Training Kernels (DeepSeek-V3 style)
+from data_pipeline.trainer.kernels.fp8_kernels import (
+    activation_quant,
+    weight_dequant,
+    FP8BlockLinear,
+    fp8_linear,
+    fast_dequantize,
+    matmul_lora,
+    E4M3_MAX,
+    E5M2_MAX,
+)
+
+# MoE Kernels (Grouped GEMM, Top-K Routing, Backward Kernels)
+from data_pipeline.trainer.kernels.moe_kernels import (
+    # Config
+    KernelConfigForward,
+    KernelConfigBackward,
+    supports_tma,
+    get_num_sms,
+    # Core functions
+    grouped_gemm_forward,
+    grouped_gemm_backward_dX,
+    grouped_gemm_backward_dW,
+    # Autograd
+    GroupedGEMM,
+    # Router
+    MoERouter,
+    # Modules
+    ExpertMLP,
+    SparseMoEBlock,
+    # High-level API
+    top_k_gating,
+    grouped_expert_forward,
+    grouped_gemm,
+)
+
+# Enhanced RoPE Kernels (Fused Q+K, YaRN/PI/NTK)
+from data_pipeline.trainer.kernels.rope_kernels import (
+    Fast_RoPE_Embedding,
+    fast_rope_embedding,
+    inplace_rope_embedding,
+    precompute_freqs_cis as precompute_freqs_cis_enhanced,
+    ROPE_GROUP_SIZE,
+)
+
+# Enhanced LayerNorm Kernels (Fused Add+Norm)
+from data_pipeline.trainer.kernels.layernorm_kernels import (
+    Fast_RMS_LayerNorm as Fast_RMS_LayerNorm_Enhanced,
+    Fast_LayerNorm,
+    fast_rms_layernorm as fast_rms_layernorm_enhanced,
+    fast_layernorm,
+    fused_add_rms_layernorm,
+)
+
+# Fused LoRA Kernels
+from data_pipeline.trainer.kernels.fast_lora_mlp import (
+    LoRA_MLP,
+    LoRA_QKV,
+    apply_lora_mlp_swiglu,
+    apply_lora_qkv,
+)
+
+# Flex Attention (Softcapping, Sliding Window)
+from data_pipeline.trainer.kernels.flex_attention import (
+    HAS_FLEX_ATTENTION,
+    slow_attention_softcapping,
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
+
 
 __all__ = [
+    # Core utilities
     "is_triton_available",
     "fused_layer_norm",
     "fused_softmax",
@@ -298,4 +387,65 @@ __all__ = [
     "naive_attention",
     "FlashAttention",
     "MultiHeadFlashAttention",
+    # SOTA Triton Kernels
+    "Fast_CrossEntropyLoss",
+    "fast_cross_entropy_loss",
+    "Fast_RMS_LayerNorm",
+    "fast_rms_layernorm",
+    "swiglu_forward",
+    "swiglu_backward",
+    "geglu_forward",
+    "apply_rope",
+    "precompute_freqs_cis",
+    "MAX_FUSED_SIZE",
+    "calculate_settings",
+    # ═══════════════════════════════════════════════
+    # NEW: Above-Unsloth Kernels
+    # ═══════════════════════════════════════════════
+    # FP8 Training
+    "activation_quant",
+    "weight_dequant",
+    "FP8BlockLinear",
+    "fp8_linear",
+    "fast_dequantize",
+    "matmul_lora",
+    "E4M3_MAX",
+    "E5M2_MAX",
+    # MoE (SOTA: Grouped GEMM + Backward + Router)
+    "KernelConfigForward",
+    "KernelConfigBackward",
+    "supports_tma",
+    "get_num_sms",
+    "grouped_gemm_forward",
+    "grouped_gemm_backward_dX",
+    "grouped_gemm_backward_dW",
+    "GroupedGEMM",
+    "MoERouter",
+    "ExpertMLP",
+    "SparseMoEBlock",
+    "top_k_gating",
+    "grouped_expert_forward",
+    "grouped_gemm",
+    # RoPE
+    "Fast_RoPE_Embedding",
+    "fast_rope_embedding",
+    "inplace_rope_embedding",
+    "precompute_freqs_cis_enhanced",
+    "ROPE_GROUP_SIZE",
+    # LayerNorm
+    "Fast_RMS_LayerNorm_Enhanced",
+    "Fast_LayerNorm",
+    "fast_rms_layernorm_enhanced",
+    "fast_layernorm",
+    "fused_add_rms_layernorm",
+    # LoRA
+    "LoRA_MLP",
+    "LoRA_QKV",
+    "apply_lora_mlp_swiglu",
+    "apply_lora_qkv",
+    # Flex Attention
+    "HAS_FLEX_ATTENTION",
+    "slow_attention_softcapping",
+    "create_causal_mask",
+    "create_sliding_window_causal_mask",
 ]

@@ -580,6 +580,20 @@ def create_loss(config: LossConfig) -> nn.Module:
         raise ValueError(f"Unknown loss type: {loss_type}")
 
 
+# SOTA Losses (Above Unsloth)
+from data_pipeline.trainer.loss.sota_losses import (
+    ChunkedCrossEntropyLoss,
+    DistillationLoss,
+    DPOLoss,
+    ORPOLoss,
+    SimPOLoss,
+    ContrastiveLoss,
+    ZLoss,
+    CombinedLoss,
+    create_loss as create_sota_loss,
+)
+
+
 # ═════════════════════════════════════════════════════════════════════════════════
 # Export
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -589,4 +603,15 @@ __all__ = [
     "KLDivergenceLoss",
     "FocalLoss",
     "create_loss",
+    # SOTA (Above Unsloth)
+    "ChunkedCrossEntropyLoss",
+    "DistillationLoss",
+    "DPOLoss",
+    "ORPOLoss",
+    "SimPOLoss",
+    "ContrastiveLoss",
+    "ZLoss",
+    "CombinedLoss",
+    "create_sota_loss",
 ]
+

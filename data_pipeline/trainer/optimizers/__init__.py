@@ -28,6 +28,17 @@ from data_pipeline.trainer.optimizers.adafactor import (
     create_adafactor,
 )
 
+# SOTA Optimizers (Above Unsloth)
+from data_pipeline.trainer.optimizers.sota_optimizers import (
+    Adam8bit,
+    Lion,
+    CAME,
+    SophiaG,
+    Prodigy,
+    FusedAdamW,
+    create_optimizer,
+)
+
 __all__ = [
     # Base
     "BaseOptimizer",
@@ -45,4 +56,13 @@ __all__ = [
     # AdaFactor
     "AdaFactor",
     "create_adafactor",
+    # SOTA (Above Unsloth)
+    "Adam8bit",
+    "Lion",
+    "CAME",
+    "SophiaG",
+    "Prodigy",
+    "FusedAdamW",
+    "create_optimizer",
 ]
+
