@@ -796,4 +796,103 @@ __all__ = [
     "ExpertParallelMoE",
     "get_expert_parallel_rank",
     "get_expert_parallel_world_size",
+    # ════════════════════════════════════════════════════════════════════════════
+    # SOTA Distributed Modules (Above SOTA-level, Triton+PyTorch)
+    # ════════════════════════════════════════════════════════════════════════════
+    # Parallel Dimensions (Multi-dimensional mesh manager)
+    "ParallelDims",
+    "create_parallel_dims",
+    "create_parallel_dims_from_config",
+    # FSDP2 (Above SOTA FSDP with Triton)
+    "SOTAFSDP2",
+    "FSDP2Config",
+    "ShardingStrategy",
+    "MixedPrecisionPolicy",
+    "create_fsdp2",
+    "create_fsdp2_from_config",
+    # DDP (Optimized DDP with gradient compression)
+    "SOTADDP",
+    "DDPConfig",
+    "GradientCompression",
+    "create_ddp",
+    "create_ddp_from_config",
+    # Context Parallel (Ultra-long sequence support)
+    "ContextParallel",
+    "ContextParallelConfig",
+    "LoadBalancer",
+    "create_context_parallel",
+    "create_context_parallel_from_config",
+    # Activation Checkpointing (Memory-efficient AC)
+    "ActivationCheckpoint",
+    "ActivationCheckpointConfig",
+    "ACMode",
+    "create_activation_checkpoint",
+    "create_activation_checkpoint_from_config",
+    # SOTA Utilities (Registry-compatible)
+    "clip_grad_norm_",
+    "dist_reduce",
+    "dist_all_gather",
+    "set_deterministic_seed",
+    "mixed_precision_context",
+    "prepare_model_for_distributed",
+    "prepare_optimizer_for_distributed",
+    "prepare_scheduler_for_distributed",
+    "log_rank_0",
+    "print_rank_0",
 ]
+
+# ════════════════════════════════════════════════════════════════════════════════
+# SOTA Module Imports (Lazy import pattern for performance)
+# ════════════════════════════════════════════════════════════════════════════════
+
+from .parallel_dims import (
+    ParallelDims,
+    create_parallel_dims,
+    create_parallel_dims_from_config,
+)
+
+from .fsdp2 import (
+    SOTAFSDP2,
+    FSDP2Config,
+    ShardingStrategy,
+    MixedPrecisionPolicy,
+    create_fsdp2,
+    create_fsdp2_from_config,
+)
+
+from .ddp import (
+    SOTADDP,
+    DDPConfig,
+    GradientCompression,
+    create_ddp,
+    create_ddp_from_config,
+)
+
+from .context_parallel import (
+    ContextParallel,
+    ContextParallelConfig,
+    LoadBalancer,
+    create_context_parallel,
+    create_context_parallel_from_config,
+)
+
+from .activation_checkpoint import (
+    ActivationCheckpoint,
+    ActivationCheckpointConfig,
+    ACMode,
+    create_activation_checkpoint,
+    create_activation_checkpoint_from_config,
+)
+
+from .sota_utils import (
+    clip_grad_norm_,
+    dist_reduce,
+    dist_all_gather,
+    set_deterministic_seed,
+    mixed_precision_context,
+    prepare_model_for_distributed,
+    prepare_optimizer_for_distributed,
+    prepare_scheduler_for_distributed,
+    log_rank_0,
+    print_rank_0,
+)

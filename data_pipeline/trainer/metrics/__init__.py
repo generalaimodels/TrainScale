@@ -444,9 +444,47 @@ def compute_perplexity(preds: Tensor, targets: Tensor) -> float:
     return Perplexity()(preds, targets)
 
 
+# ════════════════════════════════════════════════════════════════════════════════
+# SOTA Training Metrics (NEW)
+# ════════════════════════════════════════════════════════════════════════════════
+
+from .loss import LossTracker, AccuracyTracker
+from .throughput import ThroughputTracker, PEAK_TFLOPS
+from .gradient import GradientTracker
+from .training import TrainingMetrics, create_training_metrics
+from .distributed import (
+    sync_metric,
+    sync_metrics,
+    DistributedMetricBuffer,
+    is_distributed,
+    get_world_size,
+    get_rank,
+    is_main_process,
+)
+
+
 __all__ = [
+    # Base metrics
     "Metric", "Accuracy", "Precision", "Recall", "F1Score", "AUROC",
     "Perplexity", "BLEUScore", "ROUGEScore",
     "MeanSquaredError", "MeanAbsoluteError", "R2Score",
     "MetricCollection", "compute_accuracy", "compute_f1", "compute_perplexity",
+    
+    # SOTA Training Metrics (NEW)
+    "LossTracker",
+    "AccuracyTracker",
+    "ThroughputTracker",
+    "GradientTracker",
+    "TrainingMetrics",
+    "create_training_metrics",
+    "PEAK_TFLOPS",
+    
+    # Distributed utilities
+    "sync_metric",
+    "sync_metrics",
+    "DistributedMetricBuffer",
+    "is_distributed",
+    "get_world_size",
+    "get_rank",
+    "is_main_process",
 ]

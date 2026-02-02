@@ -1014,25 +1014,26 @@ class SOTARocmPipeline:
         device = torch.device(f"cuda:{local_rank}")
         self._model = self._model.to(device)
         
-        # FSDP Wrapper
+        # FSDP Wrapper - Using SOTA FSDP2 from TrainScale distributed
         if torch.distributed.is_initialized():
-            logger.info(f"🚀 Wrapping model with FullyShardedDataParallel (Rank {torch.distributed.get_rank()})")
-            from torch.distributed.fsdp import (
-                FullyShardedDataParallel as FSDP,
-                MixedPrecision,
-                BackwardPrefetch,
-                ShardingStrategy,
+            logger.info(f"🚀 Wrapping model with SOTA FSDP2 (Rank {torch.distributed.get_rank()})")
+            
+            # Import SOTA FSDP2 module
+            from data_pipeline.trainer.distributed import (
+                create_fsdp2_from_config,
+                FSDP2Config,
+                ShardingStrategy as SOTAShardingStrategy,
             )
             
-            # Simple FSDP policy for SOTA demo
-            self._model = FSDP(
-                self._model, 
-                device_id=torch.cuda.current_device(),
-                # Use mixed precision if hw config says so, but for now relying on manual autocast in loop
-                # forward_prefetch=True, 
-                use_orig_params=True, # Critical for LoRA (mixed requires_grad)
-                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP, # ZeRO-2 (Safer for 7B/LoRA on ROCm than ONE_DEVICE/FULL_SHARD)
-            )
+            # Create FSDP2 from YAML config (fully generalized)
+            sota_fsdp = create_fsdp2_from_config(self.config.raw)
+            
+            # Wrap model with SOTA FSDP2
+            # Note: FSDP2 uses use_orig_params=True by default (critical for LoRA)
+            self._model = sota_fsdp.wrap_model(self._model)
+            
+            # Store reference for gradient clipping
+            self._sota_fsdp = sota_fsdp
 
         # Initialize scheduler & optimizer AFTER model wrap (Critical for FSDP)
         self.init_scheduler(total_steps)
