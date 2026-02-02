@@ -210,3 +210,6 @@ __marimo__/
 data_pipeline/trainer/test_outputs/
 *.pt
 *.safetensors
+
+test_outputs/
+outputs/

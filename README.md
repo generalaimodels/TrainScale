@@ -54,12 +54,8 @@
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/TrainScale.git
+git clone https://github.com/generalaimodels/TrainScale.git
 cd TrainScale
-
-# Install dependencies
-pip install -r requirements.txt
-
 # Optional: Flash Attention 2
 pip install flash-attn --no-build-isolation
 ```
