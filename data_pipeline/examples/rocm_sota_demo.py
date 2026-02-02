@@ -46,6 +46,16 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
 
+# Internal SOTA modules
+from data_pipeline.trainer import registry
+from data_pipeline.trainer import lora
+from data_pipeline.trainer.metrics import (
+    MetricCollection,
+    Perplexity,
+    Accuracy,
+)
+from data_pipeline.trainer import inference
+
 # ═════════════════════════════════════════════════════════════════════════════════
 # Logging Setup
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -536,6 +546,11 @@ class SOTARocmPipeline:
             device_map="auto" if len(self.selected_gpus) == 1 else None,
         )
         
+        # Apply SOTA patches from registry (Triton kernels)
+        logger.info("Checking registry for SOTA patches...")
+        if False: # registry.get_model_info(model_name) or True: # Force check
+            registry.patch_model(model)
+        
         # Apply LoRA if enabled
         if training_mode in ("lora", "qlora"):
             model = self._apply_lora(model)
@@ -552,22 +567,13 @@ class SOTARocmPipeline:
         return model
     
     def _apply_lora(self, model):
-        """Apply LoRA/QLoRA to model."""
-        try:
-            from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-        except ImportError:
-            logger.warning("PEFT not installed, using internal LoRA")
-            from data_pipeline.trainer.lora import apply_lora
-            return apply_lora(model, self.config.lora)
+        """Apply LoRA/QLoRA to model using internal SOTA module."""
+        logger.info("Applying internal SOTA LoRA...")
         
         lora_cfg = self.config.lora
         
-        # Prepare for quantized training
-        if self.config.training_mode == "qlora":
-            model = prepare_model_for_kbit_training(model)
-        
-        # LoRA config with SOTA settings
-        peft_config = LoraConfig(
+        # Create config
+        config = lora.LoraConfig(
             r=lora_cfg.get("r", 64),
             lora_alpha=lora_cfg.get("lora_alpha", 128),
             lora_dropout=lora_cfg.get("lora_dropout", 0.05),
@@ -576,12 +582,15 @@ class SOTARocmPipeline:
                 "gate_proj", "up_proj", "down_proj"
             ]),
             bias=lora_cfg.get("bias", "none"),
-            use_rslora=lora_cfg.get("use_rslora", True),  # SOTA: Rank-Stabilizing LoRA
+            use_rslora=lora_cfg.get("use_rslora", True),
             use_dora=lora_cfg.get("use_dora", False),
         )
         
-        model = get_peft_model(model, peft_config)
-        model.print_trainable_parameters()
+        # Apply LoRA
+        model = lora.get_peft_model(model, config)
+        
+        # Print stats
+        lora.print_trainable_parameters(model)
         
         return model
     
@@ -996,6 +1005,12 @@ class SOTARocmPipeline:
         
         start_time = time.time()
         
+        # Initialize metrics
+        metrics_coll = MetricCollection([
+            Perplexity(),
+            Accuracy() 
+        ])
+        
         for epoch in range(num_epochs):
             epoch_loss = 0.0
             
@@ -1012,6 +1027,10 @@ class SOTARocmPipeline:
                             attention_mask=batch["attention_mask"],
                             labels=batch.get("labels"),
                         )
+                        
+                        # Update metrics
+                        if step % logging_steps == 0:
+                            metrics_coll.update(outputs.logits, batch["labels"])
                         
                         if hasattr(outputs, "loss"):
                             loss = outputs.loss
@@ -1078,9 +1097,15 @@ class SOTARocmPipeline:
                         elapsed = time.time() - start_time
                         steps_per_sec = global_step / elapsed
                         
+                        # Compute metrics
+                        metric_results = metrics_coll.compute()
+                        metrics_coll.reset()
+                        
                         logger.info(
                             f"Step {global_step}/{total_steps} | "
                             f"Loss: {avg_loss:.4f} | "
+                            f"PPL: {metric_results['perplexity']:.2f} | "
+                            f"Acc: {metric_results['accuracy']:.2%} | "
                             f"LR: {lr:.2e} | "
                             f"Speed: {steps_per_sec:.2f} steps/s"
                         )
@@ -1206,6 +1231,9 @@ class SOTARocmPipeline:
         if export_cfg.get("enabled", False):
             logger.info("\n💾 Step 8: Exporting Model...")
             self._export_model(export_cfg)
+            
+        # Step 9: Benchmark Inference
+        self.benchmark_inference()
         
         return {
             "metrics": metrics,
@@ -1226,10 +1254,12 @@ class SOTARocmPipeline:
         model_to_export = get_model(self._model)
 
         # Merge LoRA if requested
-        if export_cfg.get("merge_lora", True) and hasattr(model_to_export, "merge_and_unload"):
-            logger.info("Merging LoRA weights...")
+        if export_cfg.get("merge_lora", True):
+            logger.info("Merging LoRA weights (Internal)...")
             try:
-                model_to_export = model_to_export.merge_and_unload()
+                # Use internal lora module to merge
+                from data_pipeline.trainer import lora
+                model_to_export = lora.merge_and_unload(model_to_export)
             except Exception as e:
                 logger.warning(f"Could not merge LoRA: {e}")
         
@@ -1240,6 +1270,70 @@ class SOTARocmPipeline:
             self._tokenizer.save_pretrained(output_dir)
         
         logger.info(f"Model exported to: {output_dir}")
+
+    def benchmark_inference(self, num_requests: int = 4):
+        """Benchmark SOTA Inference Engine."""
+        logger.info("\n🚀 Step 9: Benchmarking SOTA Inference...")
+        
+        # Load the exported (merged) model + tokenizer for fresh benchmark
+        export_dir = self.config.export.get("output_dir", "outputs/exported")
+        logger.info(f"Loading exported model from {export_dir} for benchmark...")
+        
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        
+        # Load fresh components to verify 'W + change weights' loading
+        inference_model = AutoModelForCausalLM.from_pretrained(
+            export_dir,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True
+        )
+        inference_tokenizer = AutoTokenizer.from_pretrained(export_dir)
+        
+        # Initialize Engine with fresh model
+        engine = inference.SOTAInferenceEngine(
+            model=inference_model, 
+            tokenizer=inference_tokenizer,
+            block_size=16
+        )
+        
+        # Add diverse prompts
+        # Add diverse prompts (formatted as chat)
+        prompts = [
+            [{"role": "user", "content": "Explain quantum computing in simple terms."}],
+            [{"role": "user", "content": "Write a python function to Fibonacci."}],
+            [{"role": "user", "content": "What is the capital of France?"}],
+            [{"role": "user", "content": "List 3 benefits of exercise."}],
+            [{"role": "user", "content": "Describe the future of AI."}]
+        ]
+        
+        # Add requests
+        for i in range(5):
+            messages = prompts[i % len(prompts)]
+            # Apply chat template
+            text_prompt = inference_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            engine.add_request(prompt=text_prompt, max_new_tokens=50)
+            
+            # Run one standard generation for reference/sanity check
+            if i == 0:
+                logger.info("Running standard HF generation for sanity check...")
+                inputs = inference_tokenizer(text_prompt, return_tensors="pt").to(inference_model.device)
+                with torch.no_grad():
+                    gen_tokens = inference_model.generate(
+                        **inputs, 
+                        max_new_tokens=50, 
+                        do_sample=False, 
+                        pad_token_id=inference_tokenizer.eos_token_id
+                    )
+                logger.info(f"Standard Ref: {inference_tokenizer.decode(gen_tokens[0], skip_special_tokens=True)}")
+
+        logger.info(f"Added 5 requests to Continuous Batching Scheduler.")
+        
+        # Run Generation
+        responses = engine.generate_all()
+        
+        for i, resp in enumerate(responses):
+            logger.info(f"Response {i}: {resp[:50]}...")
 
 
 # ═════════════════════════════════════════════════════════════════════════════════

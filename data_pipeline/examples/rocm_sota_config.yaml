@@ -377,6 +377,6 @@ training:
   save_strategy: "steps"
   save_steps: 100
   save_total_limit: 3
-  logging_steps: 10
+  logging_steps: 1
   seed: 42
   resume_from_checkpoint: null

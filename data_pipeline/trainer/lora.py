@@ -166,8 +166,7 @@ class LoRALinear(nn.Module):
         )
         
         # Copy base weight (frozen)
-        lora.weight = linear.weight.data
-        lora.weight.requires_grad = False
+        lora.weight = nn.Parameter(linear.weight.data, requires_grad=False)
         
         if linear.bias is not None:
             lora.bias_param = nn.Parameter(linear.bias.data.clone())
