@@ -77,7 +77,7 @@ dataset:
     train:
       name: "train_sft"
       alias: "training"
-      sample_size: 50 # Start with 100 for rapid demo testing
+      sample_size: 10000 # Start with 100 for rapid demo testing
       shuffle: true
       seed: 42
     validation:

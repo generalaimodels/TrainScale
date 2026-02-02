@@ -924,6 +924,7 @@ class SOTARocmPipeline:
         from data_pipeline.data import DataLoaderBuilder
         from data_pipeline.core.config_schema import DataLoaderConfig
         from torch.utils.data.distributed import DistributedSampler
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         
         dl_cfg = self.config.dataloader
         
@@ -991,8 +992,7 @@ class SOTARocmPipeline:
         if max_steps > 0:
             total_steps = min(total_steps, max_steps)
         
-        # Initialize scheduler
-        self.init_scheduler(total_steps)
+        # NOTE: Scheduler init moved to AFTER model wrapping for FSDP support
         
         # Setup mixed precision
         hw_cfg = self.config.hardware
@@ -1010,16 +1010,33 @@ class SOTARocmPipeline:
         
         # Move model to device
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        torch.cuda.set_device(local_rank)
         device = torch.device(f"cuda:{local_rank}")
         self._model = self._model.to(device)
         
-        # DDP Wrapper
+        # FSDP Wrapper
         if torch.distributed.is_initialized():
-            logger.info(f"🚀 Wrapping model with DistributedDataParallel (Rank {torch.distributed.get_rank()})")
-            from torch.nn.parallel import DistributedDataParallel as DDP
-            self._model = DDP(self._model, device_ids=[local_rank], output_device=local_rank)
+            logger.info(f"🚀 Wrapping model with FullyShardedDataParallel (Rank {torch.distributed.get_rank()})")
+            from torch.distributed.fsdp import (
+                FullyShardedDataParallel as FSDP,
+                MixedPrecision,
+                BackwardPrefetch,
+                ShardingStrategy,
+            )
+            
+            # Simple FSDP policy for SOTA demo
+            self._model = FSDP(
+                self._model, 
+                device_id=torch.cuda.current_device(),
+                # Use mixed precision if hw config says so, but for now relying on manual autocast in loop
+                # forward_prefetch=True, 
+                use_orig_params=True, # Critical for LoRA (mixed requires_grad)
+                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP, # ZeRO-2 (Safer for 7B/LoRA on ROCm than ONE_DEVICE/FULL_SHARD)
+            )
+
+        # Initialize scheduler & optimizer AFTER model wrap (Critical for FSDP)
+        self.init_scheduler(total_steps)
         
-        # Training loop
         if self._is_rank_0():
             logger.info("=" * 60)
             logger.info("🚀 Starting SOTA Training (DDP)")
@@ -1240,27 +1257,41 @@ class SOTARocmPipeline:
         return metrics
     
     def _save_checkpoint(self, output_dir: str, step: int, is_final: bool = False):
-        """Save model checkpoint."""
-        checkpoint_dir = os.path.join(
-            output_dir, 
-            "final" if is_final else f"checkpoint-{step}"
+        """Save SOTA checkpoint (FSDP safe)."""
+        save_path = os.path.join(output_dir, f"checkpoint-{step}")
+        if is_final:
+            save_path = os.path.join(output_dir, "rocm_sota_export")
+            
+        logger.info(f"💾 Saving checkpoint to {save_path}...")
+        
+        # FSDP Saving Logic
+        from torch.distributed.fsdp import (
+            FullyShardedDataParallel as FSDP,
+            FullStateDictConfig,
+            StateDictType,
         )
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        # Helper to unwrap model
-        def get_model(model):
-            return model.module if hasattr(model, "module") else model
-
-        # Save model
-        model_to_save = get_model(self._model)
-        if hasattr(model_to_save, 'save_pretrained'):
-            model_to_save.save_pretrained(checkpoint_dir)
+        
+        if torch.distributed.is_initialized() and isinstance(self._model, FSDP):
+             # FSDP: Consolidate state dict on rank 0
+             save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+             with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT, save_policy):
+                cpu_state = self._model.state_dict()
+                
+             if self._is_rank_0():
+                 # Use save_pretrained with state_dict argument to save consolidated weights
+                 self._model.save_pretrained(save_path, state_dict=cpu_state)
+                 if self._tokenizer:
+                    self._tokenizer.save_pretrained(save_path)
         else:
-            torch.save(model_to_save.state_dict(), os.path.join(checkpoint_dir, "model.pt"))
+            # Fallback for single GPU or DDP (if FSDP not active)
+            if self._is_rank_0():
+                model_to_save = self._model.module if hasattr(self._model, "module") else self._model
+                model_to_save.save_pretrained(save_path)
+                if self._tokenizer:
+                    self._tokenizer.save_pretrained(save_path)
         
-        if self._tokenizer:
-            self._tokenizer.save_pretrained(checkpoint_dir)
-        
-        logger.info(f"Checkpoint saved: {checkpoint_dir}")
+        if self._is_rank_0():
+            logger.info(f"Checkpoint saved: {save_path}")
     
     # ═════════════════════════════════════════════════════════════════════════════
     # Full Pipeline Execution
@@ -1283,6 +1314,17 @@ class SOTARocmPipeline:
         # Step 1: Load datasets
         logger.info("\n📂 Step 1: Loading Dataset...")
         train_dataset = self.load_dataset("train")
+        
+        # Limit samples if requested
+        max_samples = self.config.raw.get("max_samples", -1)
+        # Also check cli override via config update (hacky, checking attr directly is better if passed)
+        
+        if hasattr(self.config, "max_samples") and self.config.max_samples > 0:
+             max_samples = self.config.max_samples
+             
+        if max_samples > 0:
+            logger.info(f"⚠️ Limiting training samples to {max_samples} for debugging")
+            train_dataset = train_dataset.select(range(min(len(train_dataset), max_samples)))
         
         eval_dataset = None
         splits = self.config.dataset.get("splits", {})
@@ -1466,6 +1508,12 @@ def main():
         action="store_true",
         help="Just verify setup without training",
     )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=-1,
+        help="Limit number of dataset samples for debugging",
+    )
     
     args = parser.parse_args()
     
@@ -1519,6 +1567,9 @@ def main():
     print("─" * 60 + "\n")
     
     # Create and run pipeline
+    if args.max_samples > 0:
+        config.max_samples = args.max_samples # Inject into config
+        
     pipeline = SOTARocmPipeline(config, selected_gpus)
     results = pipeline.run()
     
