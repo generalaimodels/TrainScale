@@ -5,332 +5,207 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 
 ---
 
-## ✨ Features
+## 🌟 Why TrainScale?
 
-### 🚀 End-to-End Pipeline
-- **Zero Hardcoding** — All settings from YAML configuration
-- **Auto-Discovery** — Automatic dataset introspection (splits, columns, schemas)
-- **SOTA Preprocessing** — Token-aware content distribution, smart truncation
-- **Production DataLoader** — Loss-aligned tensors ready for `model.forward()`
+TrainScale isn't just another training script. It's a **comprehensive, modular architecture** designed to solve the "last mile" problem in LLM training: **Data Engineering**.
 
-### 🎯 Training Modes
-| Mode | Description | VRAM Usage |
-|------|-------------|------------|
-| **Full Fine-tuning** | 16-bit/32-bit training | 100% |
-| **LoRA** | Low-rank adaptation | ~60% |
-| **QLoRA** | 4-bit NF4 quantization | ~30% |
-| **FP8** | H100/L40 optimized | ~50% |
-| **Pretraining** | From scratch | 100% |
+Most frameworks treat data loading as an afterthought. TrainScale makes it a **first-class citizen** with SOTA preprocessing features usually found only in proprietary codebases (like flexible packing, token-aware distribution, and thorough dataset introspection).
 
-### ⚡ SOTA Optimizers
-- `AdamW` — Standard with weight decay
-- `Adam8bit` — 8-bit Adam with dynamic quantization
-- `Lion` — Google's sign-momentum optimizer (2x faster)
-- `CAME` — Communication-efficient distributed
-- `SophiaG` — Second-order Hessian optimizer
-- `Prodigy` — Adaptive learning rate (no LR tuning needed)
-
-### 📊 SOTA Schedulers
-- `Cosine` — Cosine annealing with warmup
-- `WSD` — LLaMA-3 Warmup-Stable-Decay
-- `REX` — Rapid warmup + exponential decay
-- `OneCycle` — Super-convergence scheduler
-- `Polynomial` — Configurable power decay
-- `CosineRestart` — SGDR with warm restarts
-
-### 🎲 RL Training (80% VRAM Reduction)
-- **GRPO** — Group Relative Policy Optimization
-- **DrGRPO** — Dynamic Reward GRPO
-- **DAPO** — Decoupled Advantage Policy Optimization
-- **PPO** — Proximal Policy Optimization
-- **DPO/ORPO/SimPO** — Preference optimization
+### Key Differentiators
+- **Zero Hardcoding**: Every aspect of the pipeline is controlled via YAML.
+- **SOTA Data Pipeline**: Smart truncation, content-aware token distribution, and dynamic packing.
+- **Rust-Inspired Reliability**: Uses `Result<T, E>` patterns for robust error handling.
+- **Hardware Optimized**: Built-in support for Flash Attention 2, Triton kernels, and 8-bit optimizers.
 
 ---
 
-## 🛠️ Installation
+## 🏗️ Architecture
 
-```bash
-# Clone repository
-git clone https://github.com/generalaimodels/TrainScale.git
-cd TrainScale
-# Optional: Flash Attention 2
-pip install flash-attn --no-build-isolation
+The TrainScale pipeline operates in distinct, modular stages to ensure scalability and reproducibility.
+
+```mermaid
+graph LR
+    A[YAML Configuration] --> B[Dataset Introspector]
+    B --> C[Dataset Loader]
+    C --> D[Prompt Engine]
+    D --> E[Length Manager]
+    E --> F[Tokenizer Wrapper]
+    F --> G[DataLoader Builder]
+    G --> H[SOTATrainer]
+    
+    style A fill:#f9f,stroke:#333,stroke-width:2px
+    style D fill:#bbf,stroke:#333,stroke-width:2px
+    style H fill:#bfb,stroke:#333,stroke-width:2px
 ```
+
+### Component Deep Dive
+
+#### 1. Dataset Introspector
+*   **Problem:** Hardcoding split names (`train`, `validation`) and columns (`text`, `input`) makes code brittle.
+*   **Solution:** Automatically inspects HuggingFace datasets to discover available splits and columns, mapping them to a standardized schema defined in your YAML.
+
+#### 2. Prompt Engine & Length Manager (SOTA)
+*   **Problem:** Simple truncation cuts off important context; "max_length" is a blunt instrument.
+*   **Solution:** 
+    *   **Smart Truncation:** Respects sentence and word boundaries.
+    *   **Content Distribution:** Allocates token budgets intelligently (e.g., "Give 60% to context, 40% to history").
+    *   **Priority Trimming:** Drops least important columns first when context window is exceeded.
+
+#### 3. SOTA Trainer
+*   **Problem:** Training scripts are often monolithic and hard to extend.
+*   **Solution:** A modular trainer supporting multiple backends (FSDP, DDP, QLoRA) and advanced features like:
+    *   **Optimizers:** Adam8bit, Lion, SophiaG, Prodigy.
+    *   **Schedulers:** Cosine, WSD (Warmup-Stable-Decay), REX.
+    *   **Loss Functions:** Fused CrossEntropy, DPO, SimPO.
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Run E2E Pipeline Demo
+### 1. Installation
 
 ```bash
-# Quick test with small sample
+# Clone repository
+git clone https://github.com/generalaimodels/TrainScale.git
+cd TrainScale
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Optional: Flash Attention 2 (Recommended for Ampere+)
+pip install flash-attn --no-build-isolation
+```
+
+### 2. Run E2E Pipeline Demo
+
+```bash
+# Quick sanity check (100 samples, fast tokenizer)
 python data_pipeline/examples/e2e_complete_demo.py \
     --config data_pipeline/examples/test_pipeline.yaml
 
-# Full production run
-python data_pipeline/examples/e2e_complete_demo.py \
-    --config data_pipeline/examples/complete_pipeline.yaml
-```
-
-### 2. YAML Configuration
-
-All settings are controlled via YAML — **no hardcoding**:
-
-```yaml
-# ═══════════════════════════════════════════════════════════════════════════
-# Dataset Configuration
-# ═══════════════════════════════════════════════════════════════════════════
-dataset:
-  name: "tatsu-lab/alpaca"
-  splits:
-    train:
-      name: "train"
-      sample_size: 1000  # null = all data
-      shuffle: true
-      seed: 42
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Tokenizer Configuration
-# ═══════════════════════════════════════════════════════════════════════════
-tokenizer:
-  name_or_path: "meta-llama/Llama-3.1-8B-Instruct"
-  max_length: 4096
-  padding: "max_length"
-  truncation: true
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Prompt Template (Jinja2 Supported)
-# ═══════════════════════════════════════════════════════════════════════════
-prompt_template:
-  format_type: "custom"  # chat, completion, custom
-  template: |
-    ### Instruction:
-    {{ instruction }}
-    {% if input %}
-    ### Input:
-    {{ input }}
-    {% endif %}
-    ### Response:
-    {{ output }}
-  input_columns: ["instruction", "input"]
-  label_column: "output"
-  mask_input: true
-```
-
----
-
-## 🔧 Hardware & Token Settings
-
-### Recommended Settings by GPU
-
-| GPU | VRAM | Max Length | Batch Size | Precision | Mode |
-|-----|------|------------|------------|-----------|------|
-| **RTX 3090** | 24GB | 2048 | 4 | bf16 | QLoRA |
-| **RTX 4090** | 24GB | 4096 | 4 | bf16 | QLoRA |
-| **A100 40GB** | 40GB | 8192 | 8 | bf16 | LoRA |
-| **A100 80GB** | 80GB | 8192 | 16 | bf16 | Full |
-| **H100** | 80GB | 16384 | 32 | fp8 | Full |
-| **L40** | 48GB | 8192 | 12 | fp8 | Full |
-
-### YAML Hardware Configuration
-
-```yaml
-training:
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Hardware Settings
-  # ═══════════════════════════════════════════════════════════════════════════
-  hardware:
-    device: "auto"          # auto, cuda, cuda:0, cpu
-    precision: "bf16"       # bf16, fp16, fp32, fp8
-    tf32: true              # Enable TF32 (Ampere+)
-    compile_model: false    # torch.compile (PyTorch 2.0+)
-  
-  # ═══════════════════════════════════════════════════════════════════════════
-  # Memory Optimization
-  # ═══════════════════════════════════════════════════════════════════════════
-  kernels:
-    use_triton: true              # Triton kernels
-    use_flash_attention: true     # Flash Attention 2
-    use_fused_cross_entropy: true # Fused CE loss
-    activation_checkpointing: true # Gradient checkpointing
-```
-
----
-
-## 📊 Token & Sequence Settings
-
-### Preprocessing Configuration
-
-```yaml
-preprocessing:
-  # ─────────────────────────────────────────────────────────────────────────
-  # Length Manager: Per-column limits and truncation
-  # ─────────────────────────────────────────────────────────────────────────
-  length_manager:
-    enabled: true
-    max_total_length: 4096        # Maximum sequence length
-    padding_strategy: "longest"   # longest, max_length, do_not_pad, bucket
-    truncation_strategy: "smart"  # smart, simple, word_boundary, sentence_boundary
-    
-    # Per-column character limits
-    per_column_limits:
-      instruction: 4000   # Max chars for instruction
-      input: 4000         # Max chars for input
-      output: 8000        # Max chars for output
-
-  # ─────────────────────────────────────────────────────────────────────────
-  # Content Distribution: Token-aware allocation
-  # ─────────────────────────────────────────────────────────────────────────
-  content_distribution:
-    enabled: true
-    mode: "proportional"  # equal, proportional, ratio, priority, adaptive
-    column_ratios:
-      instruction: 0.3
-      input: 0.1
-      output: 0.55
-    special_tokens_budget: 10
-```
-
-### Truncation Strategies
-
-| Strategy | Description | Use Case |
-|----------|-------------|----------|
-| `smart` | Prefers sentence > word > simple | General purpose |
-| `sentence_boundary` | Truncate at sentence end | Preserves semantics |
-| `word_boundary` | Truncate at word boundary | Avoids mid-word cuts |
-| `simple` | Hard cut at limit | Maximum content |
-
-### Padding Strategies
-
-| Strategy | Description | Use Case |
-|----------|-------------|----------|
-| `longest` | Pad to longest in batch | Memory efficient |
-| `max_length` | Pad to fixed max_length | Consistent shapes |
-| `bucket` | Bucket by length (128,256,512...) | Best efficiency |
-| `do_not_pad` | No padding (for packing) | Sequence packing |
-
----
-
-## 🎮 CLI Arguments
-
-```bash
-python data_pipeline/examples/e2e_complete_demo.py \
-    --config <path>         # YAML config file (required)
-    --split <name>          # Split to use (default: train)
-    --train                 # Enable training mode
-    --output-dir <path>     # Output directory
-```
-
-### Example Commands
-
-```bash
-# Quick test (100 samples, GPT-2 tokenizer)
-python data_pipeline/examples/e2e_complete_demo.py \
-    --config data_pipeline/examples/test_pipeline.yaml
-
-# Full training with Llama-3.1
+# Full production training run
 python data_pipeline/examples/e2e_complete_demo.py \
     --config data_pipeline/examples/complete_pipeline.yaml \
     --train \
     --output-dir ./outputs
-
-# Validation split only
-python data_pipeline/examples/e2e_complete_demo.py \
-    --config my_config.yaml \
-    --split validation
 ```
 
 ---
 
-## 📁 Project Structure
+## 🔧 Hardware & Performance
 
+TrainScale is optimized for a wide range of hardware, from consumer GPUs to H100 clusters.
+
+| GPU | VRAM | Mode | Max Context | Batch Size | Technique |
+|-----|------|------|-------------|------------|-----------|
+| **RTX 3090** | 24GB | QLoRA | 2048 | 4 | 4-bit NF4 + Gradient Checkpointing |
+| **RTX 4090** | 24GB | QLoRA | 4096 | 4 | 4-bit NF4 + Flash Attn 2 |
+| **A100 40GB** | 40GB | LoRA | 8192 | 8 | BF16 + Flash Attn 2 |
+| **A100 80GB** | 80GB | Full | 8192 | 16 | BF16 + FSDP |
+| **H100** | 80GB | Full | 16384 | 32 | FP8 + Transformer Engine |
+| **Mac M1/M2** | Unified | MPS | 2048 | 1-2 | FP16 (Experimental) |
+
+---
+
+## 🛠️ Configuration Guide
+
+### 1. Preprocessing (SOTA)
+
+Control how your data is processed with granular detail:
+
+```yaml
+preprocessing:
+  length_manager:
+    enabled: true
+    max_total_length: 4096
+    truncation_strategy: "smart"  # smart, sentence_boundary, word_boundary
+    
+    # Precise control over character limits per column
+    per_column_limits:
+      instruction: 500
+      input: 2000
+      output: 1500
+
+  content_distribution:
+    enabled: true
+    mode: "proportional" # or 'priority', 'ratio'
+    column_ratios:
+      instruction: 0.2
+      input: 0.3
+      output: 0.5
 ```
-TrainScale/
-├── data_pipeline/
-│   ├── core/               # Config schema, types, errors
-│   ├── data/               # DataLoader, collate functions
-│   ├── introspection/      # Dataset discovery
-│   ├── preprocessing/      # Tokenization, prompts, length management
-│   ├── trainer/            # SOTA trainer, optimizers, schedulers
-│   │   ├── core/           # SOTAConfig, base trainer
-│   │   ├── optimizers/     # Adam8bit, Lion, CAME, SophiaG
-│   │   ├── schedulers/     # WSD, REX, OneCycle, CosineRestart
-│   │   ├── loss/           # Chunked CE, DPO, ORPO, SimPO
-│   │   └── kernels/        # Triton kernels, Flash Attention
-│   └── examples/           # Demo configs and scripts
-├── requirements.txt
-└── README.md
+
+### 2. Training (SOTA)
+
+Switch between training modes and hardware optimizations instantly:
+
+```yaml
+training:
+  mode: "qlora" # full, lora, qlora
+  
+  hardware:
+    precision: "bf16"
+    compile_model: true  # torch.compile
+  
+  optimizer:
+    type: "adamw_8bit"   # 75% memory saving over standard AdamW
+    learning_rate: 2e-4
+  
+  scheduler:
+    type: "wsd"          # Warmup-Stable-Decay (LLaMA-3 style)
 ```
 
 ---
 
-## 🧪 Verification
+## 🤝 How to Contribute
 
-Run the test suite to verify installation:
+We welcome contributions! Whether you're fixing a bug, adding a new feature, or improving documentation, here's how you can help:
 
-```bash
-# Test imports
-python -c "from data_pipeline.trainer import SOTAConfig, SOTATrainer; print('✅ Imports OK')"
+### Areas for Contribution
+- [ ] **New Data Connectors:** Support for SQL, S3, or Arrow datasets.
+- [ ] **Additional Kernels:** Implement optimized Triton kernels for new attention mechanisms.
+- [ ] **Model Support:** Add configs for new architectures (Mistral, Gemma, Phi).
+- [ ] **Benchmarks:** Run hardware benchmarks and update the README table.
 
-# Test E2E pipeline
-python data_pipeline/examples/e2e_complete_demo.py \
-    --config data_pipeline/examples/test_pipeline.yaml
-```
+### Development Standards
+1.  **Type Hints**: All code must be fully type-hinted (`mypy` compliant).
+2.  **Error Handling**: Use the `Result` type from `core/types.py` instead of raising raw exceptions where possible.
+3.  **Config-First**: Avoid hardcoding. If a value might change, put it in the YAML schema.
+4.  **Tests**: Add unit tests for new modules. Run existing tests before pushing.
 
-Expected output:
-```
-============================================================
-PIPELINE SUMMARY
-============================================================
-Config: data_pipeline/examples/test_pipeline.yaml
-Discovered splits: ['train']
-Discovered columns: ['instruction', 'input', 'output', 'text']
-
-Batch Output:
-  input_ids: torch.Size([4, 512]) (torch.int64)
-  attention_mask: torch.Size([4, 512])
-  labels: torch.Size([4, 512])
-
-✅ Pipeline complete! Tensors are ready for model.forward()
-```
+### Submission Process
+1.  Fork the repo.
+2.  Create a branch: `git checkout -b feature/my-cool-feature`.
+3.  Commit your changes.
+4.  Push to your fork and submit a Pull Request.
 
 ---
 
-## 📚 Documentation
+## 🗺️ Roadmap
 
-- [Complete Pipeline YAML](data_pipeline/examples/complete_pipeline.yaml) — Full production config
-- [Test Pipeline YAML](data_pipeline/examples/test_pipeline.yaml) — Quick testing config
-- [SOTA Config Schema](data_pipeline/trainer/core/sota_config.py) — All training options
+- **Phase 1: Foundation (Complete)** ✅
+    - [x] End-to-end YAML pipeline
+    - [x] SOTA preprocessing module
+    - [x] QLoRA/LoRA support
 
----
+- **Phase 2: Scale (In Progress)** 🚧
+    - [ ] Multi-node FSDP training
+    - [ ] DeepSpeed integration
+    - [ ] Streaming dataset support for infinite datasets
 
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit changes (`git commit -m 'Add amazing feature'`)
-4. Push to branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+- **Phase 3: Multimodal (Planned)** 🔮
+    - [ ] Image/Video tokenization support
+    - [ ] Audio processing pipeline
 
 ---
 
 ## 📄 License
 
 MIT License — see [LICENSE](LICENSE) for details.
-
----
-
-## ⭐ Acknowledgments
-
-TrainScale builds upon excellent open-source projects:
-- [HuggingFace Transformers](https://github.com/huggingface/transformers)
-- [PyTorch](https://pytorch.org/)
-- [Flash Attention](https://github.com/Dao-AILab/flash-attention)
-- [bitsandbytes](https://github.com/TimDettmers/bitsandbytes)
 
 ---
 
