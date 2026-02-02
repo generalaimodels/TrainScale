@@ -1,6 +1,6 @@
 # TrainScale
 
-> **A Scalable SOTA PyTorch Training Framework** — Above-Unsloth-level capabilities with 100% YAML-driven configuration.
+> **A Scalable SOTA PyTorch Training Framework** — SOTA-level capabilities with 100% YAML-driven configuration.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
