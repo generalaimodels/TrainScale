@@ -48,7 +48,7 @@ DTYPE_MAP: Dict[str, torch.dtype] = {
 # ─────────────────────────────────────────────────────────────────────────────────
 
 def pad_sequence_right(
-    sequences: List[Tensor],
+    sequences: List[Union[Tensor, List[int]]],
     padding_value: int = 0,
     max_length: Optional[int] = None,
 ) -> Tensor:
@@ -56,18 +56,28 @@ def pad_sequence_right(
     Pad sequences on the right side.
     
     Vectorized implementation using torch operations.
+    Handles both tensors and lists as input.
     
     Time Complexity: O(batch_size * max_length)
     Space Complexity: O(batch_size * max_length)
     
     Args:
-        sequences: List of 1D tensors to pad
+        sequences: List of 1D tensors or lists of ints to pad
         padding_value: Value to use for padding
         max_length: Maximum length (uses longest sequence if None)
         
     Returns:
         Padded 2D tensor of shape (batch_size, max_length)
     """
+    # Convert lists to tensors if needed
+    converted = []
+    for seq in sequences:
+        if isinstance(seq, list):
+            converted.append(torch.tensor(seq, dtype=torch.long))
+        else:
+            converted.append(seq)
+    sequences = converted
+    
     # Determine max length
     lengths = [len(seq) for seq in sequences]
     target_length = max_length or max(lengths)
@@ -90,7 +100,7 @@ def pad_sequence_right(
 
 
 def pad_sequence_left(
-    sequences: List[Tensor],
+    sequences: List[Union[Tensor, List[int]]],
     padding_value: int = 0,
     max_length: Optional[int] = None,
 ) -> Tensor:
@@ -98,18 +108,28 @@ def pad_sequence_left(
     Pad sequences on the left side.
     
     Useful for decoder-only models during inference.
+    Handles both tensors and lists as input.
     
     Time Complexity: O(batch_size * max_length)
     Space Complexity: O(batch_size * max_length)
     
     Args:
-        sequences: List of 1D tensors to pad
+        sequences: List of 1D tensors or lists of ints to pad
         padding_value: Value to use for padding
         max_length: Maximum length (uses longest sequence if None)
         
     Returns:
         Padded 2D tensor of shape (batch_size, max_length)
     """
+    # Convert lists to tensors if needed
+    converted = []
+    for seq in sequences:
+        if isinstance(seq, list):
+            converted.append(torch.tensor(seq, dtype=torch.long))
+        else:
+            converted.append(seq)
+    sequences = converted
+    
     lengths = [len(seq) for seq in sequences]
     target_length = max_length or max(lengths)
     batch_size = len(sequences)

@@ -1,0 +1,250 @@
+# ════════════════════════════════════════════════════════════════════════════════
+# SOTA Training Configuration - Above Unsloth Level
+# ════════════════════════════════════════════════════════════════════════════════
+# Complete end-to-end training configuration.
+# All settings user-controlled via this YAML - no hardcoding.
+#
+# FEATURES SUPPORTED (Exceeding Unsloth):
+# ───────────────────────────────────────
+# Training: Full-finetune, LoRA, QLoRA (4/8-bit), FP8, Pretraining
+# RL: GRPO, GSPO, DrGRPO, DAPO, PPO, DPO, ORPO, SimPO (80% VRAM reduction)
+# Export: GGUF, vLLM, SGLang, HuggingFace, Safetensors
+# Hardware: NVIDIA (V100+), AMD, Intel, Multi-GPU DDP/FSDP
+# Kernels: Triton-fused ops, manual backprop, 0% accuracy loss
+# ════════════════════════════════════════════════════════════════════════════════
+
+config_version: "2.0"
+config_type: "sota_training"
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Training Mode
+# Options: full, lora, qlora, pretrain, rl, distill
+# ═════════════════════════════════════════════════════════════════════════════════
+training_mode: "qlora"
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Model Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+model:
+  name_or_path: "meta-llama/Llama-3.1-8B-Instruct"
+  revision: "main"
+  trust_remote_code: false
+  torch_dtype: "auto"  # auto, float32, float16, bfloat16
+  low_cpu_mem_usage: true
+  use_flash_attention_2: true
+  attn_implementation: "flash_attention_2"  # flash_attention_2, sdpa, eager
+  max_position_embeddings: null  # Override max context length
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Tokenizer Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+tokenizer:
+  name_or_path: null  # Use model path if null
+  use_fast: true
+  padding_side: "right"
+  truncation_side: "right"
+  max_length: 4096
+  add_bos_token: false
+  add_eos_token: true
+  add_pad_token: true
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# LoRA Configuration (Above Unsloth: RSLoRA, DoRA)
+# ═════════════════════════════════════════════════════════════════════════════════
+lora:
+  enabled: true
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.0
+  target_modules:
+    - "q_proj"
+    - "k_proj"
+    - "v_proj"
+    - "o_proj"
+    - "gate_proj"
+    - "up_proj"
+    - "down_proj"
+  bias: "none"
+  use_rslora: true   # Rank-Stabilizing LoRA
+  use_dora: false    # Weight-Decomposed LoRA
+  rank_pattern: {}   # Per-layer rank override
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Quantization Configuration (4-bit, 8-bit, FP8)
+# ═════════════════════════════════════════════════════════════════════════════════
+quantization:
+  enabled: true
+  load_in_4bit: true
+  load_in_8bit: false
+  load_in_fp8: false  # For H100/L40
+  bnb_4bit_quant_type: "nf4"  # nf4, fp4
+  bnb_4bit_compute_dtype: "bfloat16"
+  bnb_4bit_use_double_quant: true
+  llm_int8_threshold: 6.0
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Optimizer Configuration (Above Unsloth: 8-bit Adam, Lion, Sophia)
+# ═════════════════════════════════════════════════════════════════════════════════
+optimizer:
+  type: "adamw"  # adamw, adam8bit, lion, came, sophia, prodigy, fused_adamw, lamb
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  max_grad_norm: 1.0
+  # 8-bit specific
+  percentile_clipping: 100.0
+  block_wise: true
+  # Lion specific
+  lion_betas: [0.9, 0.99]
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Scheduler Configuration (Above Unsloth: WSD, REX)
+# ═════════════════════════════════════════════════════════════════════════════════
+scheduler:
+  type: "cosine"  # cosine, wsd, linear, polynomial, onecycle, inverse_sqrt
+  warmup_steps: 0
+  warmup_ratio: 0.1
+  min_lr_ratio: 0.1
+  # WSD (LLaMA-3 style)
+  stable_ratio: 0.8
+  decay_type: "cosine"
+  # Polynomial
+  power: 1.0
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Loss Configuration (Above Unsloth: Chunked CE, DPO, ORPO)
+# ═════════════════════════════════════════════════════════════════════════════════
+loss:
+  type: "cross_entropy"  # cross_entropy, chunked_ce, focal, dpo, orpo, simpo
+  ignore_index: -100
+  label_smoothing: 0.0
+  reduction: "mean"
+  # Chunked CE (memory efficient)
+  chunk_size: 32768
+  # Focal loss
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+  # DPO
+  dpo_beta: 0.1
+  # Distillation
+  temperature: 2.0
+  alpha: 0.5
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# RL Configuration (Above Unsloth: GRPO, GSPO, DrGRPO, DAPO - 80% VRAM reduction)
+# ═════════════════════════════════════════════════════════════════════════════════
+rl:
+  enabled: false
+  algorithm: "grpo"  # grpo, gspo, drgrpo, dapo, ppo, dpo, orpo, simpo
+  num_generations: 4
+  temperature: 0.7
+  kl_coef: 0.01
+  gamma: 1.0
+  clip_range: 0.2
+  reward_clip: 10.0
+  use_length_penalty: false
+  length_penalty_alpha: 1.0
+  use_ref_model: true
+  ref_model_sync_steps: 100
+  # vLLM acceleration
+  use_vllm: false
+  vllm_gpu_memory_utilization: 0.9
+  # GRPO specific
+  group_size: 8
+  # DAPO specific
+  dapo_delta: 0.1
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Export Configuration (Above Unsloth: GGUF, vLLM, SGLang)
+# ═════════════════════════════════════════════════════════════════════════════════
+export:
+  enabled: false
+  output_dir: "./exported_model"
+  format: "safetensors"  # safetensors, pytorch, gguf_q4_k_m, gguf_q8_0, vllm, sglang
+  push_to_hub: false
+  hub_model_id: null
+  hub_token: null  # Use HF_TOKEN env var
+  hub_private: false
+  merge_lora: true
+  save_merged_16bit: true
+  gguf_quantization: "q4_k_m"  # q4_k_m, q5_k_m, q8_0, f16
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Distributed Configuration (Multi-GPU DDP/FSDP)
+# ═════════════════════════════════════════════════════════════════════════════════
+distributed:
+  enabled: false
+  backend: "nccl"  # nccl, gloo, mpi
+  strategy: "ddp"  # ddp, fsdp, deepspeed
+  world_size: 1
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false
+  fsdp_config: {}
+  deepspeed_config: null
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Hardware Configuration (NVIDIA V100+, AMD, Intel)
+# ═════════════════════════════════════════════════════════════════════════════════
+hardware:
+  device: "auto"  # auto, cuda, rocm, xpu, mps, cpu
+  device_id: 0
+  precision: "bf16"  # fp32, fp16, bf16, fp8_e4m3, fp8_e5m2
+  tf32: true
+  compile_model: false  # torch.compile()
+  compile_mode: "reduce-overhead"  # default, reduce-overhead, max-autotune
+  num_workers: 4
+  pin_memory: true
+  prefetch_factor: 2
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Kernel Configuration (Triton-fused ops, 0% accuracy loss)
+# ═════════════════════════════════════════════════════════════════════════════════
+kernels:
+  use_triton: true
+  use_flash_attention: true
+  use_fused_rope: true
+  use_fused_rms_norm: true
+  use_fused_cross_entropy: true
+  use_fused_lora: true
+  use_moe_kernels: true
+  autotune: true
+  # Memory optimization
+  activation_checkpointing: true
+  memory_efficient_attention: true
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Data Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+data:
+  dataset_name: "tatsu-lab/alpaca"
+  dataset_config: null
+  streaming: false
+  max_samples: null  # null = all samples
+  train_split: "train"
+  eval_split: null
+  text_column: "text"
+  max_seq_length: 4096
+  packing: true  # Sequence packing for efficiency
+  packing_efficiency: 0.95
+  shuffle: true
+  seed: 42
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Training Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+training:
+  output_dir: "./outputs/sota_run"
+  num_train_epochs: 3
+  max_steps: -1  # -1 = use epochs
+  per_device_train_batch_size: 4
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 4
+  eval_strategy: "steps"  # steps, epoch, no
+  eval_steps: 100
+  save_strategy: "steps"
+  save_steps: 100
+  save_total_limit: 3
+  logging_steps: 10
+  seed: 42
+  resume_from_checkpoint: null

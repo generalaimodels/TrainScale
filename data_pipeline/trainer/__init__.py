@@ -174,6 +174,81 @@ from data_pipeline.trainer.kernels import (
     compile_model,
 )
 
+# ════════════════════════════════════════════════════════════════════════════════
+# SOTA Imports (Above Unsloth Level)
+# ════════════════════════════════════════════════════════════════════════════════
+
+# SOTA Optimizers
+from data_pipeline.trainer.optimizers import (
+    Adam8bit,
+    Lion,
+    CAME,
+    SophiaG,
+    Prodigy,
+    FusedAdamW,
+    create_optimizer,
+)
+
+# SOTA Schedulers
+from data_pipeline.trainer.schedulers import (
+    BaseEnhancedScheduler,
+    WSDScheduler,
+    REXScheduler,
+    OneCycleSchedulerEnhanced,
+    PolynomialDecayScheduler,
+    InverseSquareRootScheduler,
+    CosineRestartScheduler,
+    create_sota_scheduler,
+)
+
+# SOTA Losses
+from data_pipeline.trainer.loss import (
+    ChunkedCrossEntropyLoss,
+    DistillationLoss,
+    DPOLoss,
+    ORPOLoss,
+    SimPOLoss,
+    ContrastiveLoss,
+    ZLoss,
+    CombinedLoss,
+    create_sota_loss,
+)
+
+# SOTA Config
+from data_pipeline.trainer.core.sota_config import (
+    SOTAConfig,
+    TrainingMode as SOTATrainingMode,
+    Precision as SOTAPrecision,
+    RLAlgorithm,
+    ExportFormat,
+    OptimizerType as SOTAOptimizerType,
+    SchedulerType as SOTASchedulerType,
+    LossType as SOTALossType,
+    DeviceType as SOTADeviceType,
+    ModelConfig,
+    TokenizerConfig,
+    LoRAConfig,
+    QuantizationConfig as SOTAQuantizationConfig,
+    RLConfig,
+    ExportConfig,
+    HardwareConfig,
+    KernelConfig,
+    DataConfig,
+    TrainConfig,
+    get_qlora_preset,
+    get_full_finetune_preset,
+    get_fp8_preset,
+    get_rl_grpo_preset,
+    get_dpo_preset,
+)
+
+# SOTA Trainer
+from data_pipeline.trainer.trainers.sota_trainer import (
+    SOTATrainer,
+    TrainingState as SOTATrainingState,
+    create_trainer,
+)
+
 __all__ = [
     # ─────────────────────────────────────────────────────────────
     # Core Types
@@ -331,4 +406,64 @@ __all__ = [
     "fused_softmax",
     "fused_gelu",
     "compile_model",
+    # ═════════════════════════════════════════════════════════════
+    # SOTA (Above Unsloth Level)
+    # ═════════════════════════════════════════════════════════════
+    # SOTA Optimizers
+    "Adam8bit",
+    "Lion",
+    "CAME",
+    "SophiaG",
+    "Prodigy",
+    "FusedAdamW",
+    "create_optimizer",
+    # SOTA Schedulers
+    "BaseEnhancedScheduler",
+    "WSDScheduler",
+    "REXScheduler",
+    "OneCycleSchedulerEnhanced",
+    "PolynomialDecayScheduler",
+    "InverseSquareRootScheduler",
+    "CosineRestartScheduler",
+    "create_sota_scheduler",
+    # SOTA Losses
+    "ChunkedCrossEntropyLoss",
+    "DistillationLoss",
+    "DPOLoss",
+    "ORPOLoss",
+    "SimPOLoss",
+    "ContrastiveLoss",
+    "ZLoss",
+    "CombinedLoss",
+    "create_sota_loss",
+    # SOTA Config
+    "SOTAConfig",
+    "SOTATrainingMode",
+    "SOTAPrecision",
+    "RLAlgorithm",
+    "ExportFormat",
+    "SOTAOptimizerType",
+    "SOTASchedulerType",
+    "SOTALossType",
+    "SOTADeviceType",
+    "ModelConfig",
+    "TokenizerConfig",
+    "LoRAConfig",
+    "SOTAQuantizationConfig",
+    "RLConfig",
+    "ExportConfig",
+    "HardwareConfig",
+    "KernelConfig",
+    "DataConfig",
+    "TrainConfig",
+    "get_qlora_preset",
+    "get_full_finetune_preset",
+    "get_fp8_preset",
+    "get_rl_grpo_preset",
+    "get_dpo_preset",
+    # SOTA Trainer
+    "SOTATrainer",
+    "SOTATrainingState",
+    "create_trainer",
 ]
+
