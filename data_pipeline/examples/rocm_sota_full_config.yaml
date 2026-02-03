@@ -313,7 +313,7 @@ training:
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 8
   gradient_accumulation_steps: 4
-  eval_strategy: "epochs"
+  eval_strategy: "steps"    # Changed from 'epochs'
   eval_steps: 10
   save_strategy: "epochs"
   save_steps: 10

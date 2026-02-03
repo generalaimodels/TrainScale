@@ -308,9 +308,19 @@ class SOTADemo:
         )
         dataloader = unwrap(dl_result)
         
+        # Create Eval DataLoader
+        eval_dl_result = self._data_pipeline.get_dataloader(
+            split=trainer.config.data.eval_split,
+            batch_size=trainer.config.training.per_device_eval_batch_size,
+            distributed=(self.dist_state.world_size > 1),
+            rank=self.dist_state.rank,
+            world_size=self.dist_state.world_size,
+        )
+        eval_dataloader = unwrap(eval_dl_result)
+        
         # 4. Train
         log_rank_0("Starting Training Loop...")
-        metrics = trainer.train(dataloader)
+        metrics = trainer.train(dataloader, eval_dataloader=eval_dataloader)
         
         log_rank_0("Training Complete!")
         log_rank_0(f"Final Metrics: {metrics}")

@@ -21,8 +21,11 @@ from __future__ import annotations
 import logging
 import os
 import datetime
+import math
 import time
 import warnings
+import random
+import numpy as np
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -537,6 +540,13 @@ class SOTATrainer:
         metrics = {"train_loss": 0.0}
         self.start_time = time.time()
         
+        if eval_dataloader is not None and (not dist.is_initialized() or dist.get_rank() == 0):
+             try:
+                 num_eval_batches = len(eval_dataloader)
+                 logger.info(f"Eval DataLoader ready with {num_eval_batches} batches.")
+             except:
+                 logger.info("Eval DataLoader ready (length unknown).")
+
         for epoch in range(train_cfg.num_train_epochs):
             self.state.epoch = epoch
             
@@ -599,6 +609,10 @@ class SOTATrainer:
                 else:
                     loss_scaled.backward()
                 
+                if self.state.global_step % 10 == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
+                    # Debug log to verify liveness
+                    pass 
+
                 # Optimizer step
                 if (step + 1) % grad_accum == 0:
                     if self.scaler is not None:
@@ -626,39 +640,63 @@ class SOTATrainer:
                     self.state.global_step += 1
                     
                     # Logging (Rank 0 only)
+                    
+                    # Logging (Rank 0 only)
                     is_main = not dist.is_initialized() or dist.get_rank() == 0
-                    if self.state.global_step % train_cfg.logging_steps == 0 and is_main:
-                        # Use EMA for responsive logging where possible
+                    if self.state.global_step % train_cfg.logging_steps == 0:
+                        # Collect local metrics
                         loss_val = loss_tracker.compute_ema()
-                        if loss_val == 0.0:  # Fallback if EMA not ready
+                        if loss_val == 0.0:
                             loss_val = loss_tracker.compute_avg()
-                            ppl = loss_tracker.compute_ppl()
-                        else:
-                            ppl = loss_tracker.compute_ppl_ema()
                             
                         acc = acc_tracker.compute()
-                        lr = self.scheduler.get_last_lr()[0]
+                        grad_norm_val = grad_norm if isinstance(grad_norm, float) else grad_norm.item()
                         
-                        # ETA Calculation
-                        elapsed_time = time.time() - self.start_time
-                        avg_step_time = elapsed_time / self.state.global_step
-                        remaining_steps = num_training_steps - self.state.global_step
-                        eta_seconds = averaged_step_time * remaining_steps if 'averaged_step_time' in locals() else avg_step_time * remaining_steps
-                        eta_str = str(datetime.timedelta(seconds=int(eta_seconds)))
+                        # Reduce metrics across ranks (Global View)
+                        metrics_to_reduce = {
+                            "loss": loss_val,
+                            "acc": acc,
+                            "grad": grad_norm_val
+                        }
                         
-                        logger.info(
-                            f"Epoch {epoch+1}/{train_cfg.num_train_epochs} | "
-                            f"Step {self.state.global_step}/{num_training_steps} | "
-                            f"Loss: {loss_val:.4f} | "
-                            f"PPL: {ppl:.2f} | "
-                            f"Acc: {acc:.2%} | "
-                            f"LR: {lr:.2e} | "
-                            f"Grad: {grad_norm:.2f} | "
-                            f"Tok/Sec: {int(num_tokens * grad_accum / (time.time() - step_start_time))} | "
-                            f"ETA: {eta_str}"
-                        )
-                        # Reset accuracy for next window
-                        acc_tracker.reset()
+                        if dist.is_initialized():
+                            # Simple average reduction for stability
+                            tensor_vals = torch.tensor(
+                                [metrics_to_reduce["loss"], metrics_to_reduce["acc"], metrics_to_reduce["grad"]], 
+                                device=self.device
+                            )
+                            dist.all_reduce(tensor_vals, op=dist.ReduceOp.AVG)
+                            metrics_to_reduce["loss"] = tensor_vals[0].item()
+                            metrics_to_reduce["acc"] = tensor_vals[1].item()
+                            metrics_to_reduce["grad"] = tensor_vals[2].item()
+                        
+                        if is_main:
+                            # Derived Global Metrics
+                            ppl = torch.exp(torch.tensor(metrics_to_reduce["loss"])).item()
+                            lr = self.scheduler.get_last_lr()[0]
+                            
+                            # Consistent Global ETA
+                            current_time = time.time()
+                            elapsed = current_time - self.start_time
+                            steps_done = self.state.global_step
+                            avg_time_per_step = elapsed / steps_done if steps_done > 0 else 0
+                            remaining_steps = num_training_steps - steps_done
+                            eta_seconds = int(avg_time_per_step * remaining_steps)
+                            eta_str = str(datetime.timedelta(seconds=eta_seconds))
+                            
+                            logger.info(
+                                f"Epoch {epoch+1}/{train_cfg.num_train_epochs} | "
+                                f"Step {steps_done}/{num_training_steps} | "
+                                f"Loss: {metrics_to_reduce['loss']:.4f} | " # Global
+                                f"PPL: {ppl:.2f} | "                         # Global
+                                f"Acc: {metrics_to_reduce['acc']:.2%} | "   # Global
+                                f"LR: {lr:.2e} | "
+                                f"Grad: {metrics_to_reduce['grad']:.2f} | " # Global
+                                f"Tok/Sec: {int(num_tokens * grad_accum * (dist.get_world_size() if dist.is_initialized() else 1) / (current_time - step_start_time))} | "
+                                f"ETA: {eta_str}"
+                            )
+                            # Reset independently per rank, but tracked globally above
+                            acc_tracker.reset()
                     
                     # Evaluation
                     if (
@@ -671,6 +709,14 @@ class SOTATrainer:
                         
                         if self._check_early_stopping(eval_metrics):
                             logger.info("Early stopping triggered.")
+                            
+                            # Restore Best Model
+                            best_path = os.path.join(train_cfg.output_dir, "checkpoint-best")
+                            if os.path.exists(best_path):
+                                logger.info(f"Restoring best model from {best_path}...")
+                                self.load_checkpoint(best_path)
+                                metrics["best_metric"] = self.state.best_metric
+                                
                             return metrics
                     
                     # Saving
@@ -700,6 +746,14 @@ class SOTATrainer:
             if train_cfg.save_strategy == "epoch":
                 self.save_checkpoint()
         
+        
+        # End of training restoration
+        best_path = os.path.join(train_cfg.output_dir, "checkpoint-best")
+        if os.path.exists(best_path):
+             logger.info(f"Training finished. Restoring best model from {best_path}...")
+             self.load_checkpoint(best_path)
+             metrics["best_metric"] = self.state.best_metric
+
         return metrics
     
     def _training_step(self, batch: Dict[str, Tensor]) -> Tensor:
@@ -748,10 +802,31 @@ class SOTATrainer:
                     loss = self._training_step(batch)
                 total_loss += loss.item()
                 num_batches += 1
+                
+                # Speed up for demo/debug runs
+                if self.config.training.max_steps > 0 and self.config.training.max_steps < 100 and num_batches >= 5:
+                    break
         
         self.model.train()
         
-        metrics = {"loss": total_loss / num_batches}
+        # Aggregate across ranks
+        if dist.is_initialized():
+             # Sum loss and counts
+             tensor_agg = torch.tensor([total_loss, float(num_batches)], device=self.device)
+             dist.all_reduce(tensor_agg, op=dist.ReduceOp.SUM)
+             global_total_loss = tensor_agg[0].item()
+             global_num_batches = tensor_agg[1].item()
+        else:
+             global_total_loss = total_loss
+             global_num_batches = num_batches
+             
+        avg_loss = global_total_loss / global_num_batches if global_num_batches > 0 else 0.0
+        
+        metrics = {"loss": avg_loss}
+        try:
+             metrics["ppl"] = math.exp(avg_loss)
+        except OverflowError:
+             metrics["ppl"] = float("inf")
         
         if compute_metrics is not None:
             metrics.update(compute_metrics(self.model, eval_dataloader))
@@ -765,9 +840,17 @@ class SOTATrainer:
         threshold = self.config.training.early_stopping_threshold
         
         # Check improvement (minimizing loss)
+        # Check improvement (minimizing loss)
         if current_loss < (self.state.best_metric - threshold):
             self.state.best_metric = current_loss
             self.state.patience_counter = 0
+            
+            # Save Best Checkpoint
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                best_path = os.path.join(self.config.training.output_dir, "checkpoint-best")
+                logger.info(f"New best model (Loss: {current_loss:.4f}). Saving to {best_path}...")
+                self.save_checkpoint(path=best_path)
+                
             return False
             
         self.state.patience_counter += 1
@@ -804,6 +887,12 @@ class SOTATrainer:
             "scheduler": self.scheduler.state_dict() if self.scheduler else None,
             "state": self.state,
             "config": self.config.to_dict(),
+            "rng_state": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            }
         }, os.path.join(path, "trainer_state.pt"))
         
         logger.info(f"Checkpoint saved: {path}")
@@ -813,15 +902,36 @@ class SOTATrainer:
         # Load trainer state
         state_path = os.path.join(path, "trainer_state.pt")
         if os.path.exists(state_path):
-            checkpoint = torch.load(state_path, map_location=self.device)
+            checkpoint = torch.load(state_path, map_location=self.device, weights_only=False)
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             if self.scheduler and checkpoint["scheduler"]:
                 self.scheduler.load_state_dict(checkpoint["scheduler"])
             self.state = checkpoint["state"]
+            
+            # Restore RNG state
+            if "rng_state" in checkpoint:
+                rng = checkpoint["rng_state"]
+                try:
+                    random.setstate(rng["python"])
+                    np.random.set_state(rng["numpy"])
+                    torch.set_rng_state(rng["torch"].cpu())
+                    if rng["cuda"] is not None and torch.cuda.is_available():
+                        torch.cuda.set_rng_state_all([t.cpu() for t in rng["cuda"]] if isinstance(rng["cuda"], list) else rng["cuda"].cpu())
+                except Exception as e:
+                    logger.warning(f"Failed to restore RNG state: {e}")
         
         # Load model
         if hasattr(self.model, 'load_adapter'):
-            self.model.load_adapter(path)
+            # For PEFT models
+            try:
+                self.model.load_adapter(path, adapter_name="default")
+            except Exception as e:
+                 # Try without adapter_name or log error
+                 logger.warning(f"Note: load_adapter failed with 'default' name, trying fallback or ignoring: {e}")
+                 try:
+                     self.model.load_adapter(path)
+                 except Exception as e2:
+                     logger.warning(f"Failed to load adapter: {e2}")
         else:
             model_path = os.path.join(path, "model.pt")
             if os.path.exists(model_path):
