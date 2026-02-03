@@ -158,6 +158,7 @@ class LossTracker:
         
         if num_tokens > 0:
             avg_loss = loss.item() / num_tokens
+            # Ensure proper scaling for update
             self.update(avg_loss, num_tokens=num_tokens)
             return avg_loss
         

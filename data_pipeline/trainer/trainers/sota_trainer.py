@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import datetime
 import time
 import warnings
 from contextlib import nullcontext
@@ -145,12 +146,12 @@ class SOTATrainer:
         
         if precision == Precision.FP16:
             self.scaler = torch.cuda.amp.GradScaler()
-            return lambda: torch.cuda.amp.autocast(dtype=torch.float16)
+            return lambda: torch.amp.autocast('cuda', dtype=torch.float16)
         elif precision == Precision.BF16:
-            return lambda: torch.cuda.amp.autocast(dtype=torch.bfloat16)
+            return lambda: torch.amp.autocast('cuda', dtype=torch.bfloat16)
         elif precision in (Precision.FP8_E4M3, Precision.FP8_E5M2):
             # FP8 requires special handling
-            return lambda: torch.cuda.amp.autocast(dtype=torch.bfloat16)
+            return lambda: torch.amp.autocast('cuda', dtype=torch.bfloat16)
         else:
             return lambda: nullcontext()
     
@@ -229,7 +230,7 @@ class SOTATrainer:
             model_cfg.name_or_path,
             revision=model_cfg.revision,
             trust_remote_code=model_cfg.trust_remote_code,
-            torch_dtype=model_cfg.torch_dtype if model_cfg.torch_dtype != "auto" else "auto",
+            dtype=model_cfg.torch_dtype if model_cfg.torch_dtype != "auto" else "auto",
             low_cpu_mem_usage=model_cfg.low_cpu_mem_usage,
             attn_implementation=model_cfg.attn_implementation,
             quantization_config=bnb_config,
@@ -402,9 +403,9 @@ class SOTATrainer:
                 from data_pipeline.trainer.schedulers import WSDScheduler
                 self.scheduler = WSDScheduler(
                     self.optimizer,
+                    num_training_steps=num_training_steps,
                     warmup_steps=warmup_steps,
                     stable_steps=int(sch_cfg.stable_ratio * num_training_steps),
-                    total_steps=num_training_steps,
                     min_lr_ratio=sch_cfg.min_lr_ratio,
                     decay_type=sch_cfg.decay_type,
                 )
@@ -517,26 +518,77 @@ class SOTATrainer:
         max_grad_norm = self.config.optimizer.max_grad_norm
         
         # Training loop
+        # Trackers
+        from data_pipeline.trainer.metrics.loss import LossTracker, AccuracyTracker
+        loss_tracker = LossTracker(ema_decay=0.99)
+        acc_tracker = AccuracyTracker()
+        
+        # Training loop
         self.model.train()
         metrics = {"train_loss": 0.0}
+        self.start_time = time.time()
         
         for epoch in range(train_cfg.num_train_epochs):
             self.state.epoch = epoch
-            epoch_loss = 0.0
             
             for step, batch in enumerate(train_dataloader):
+                step_start_time = time.time()
                 # Forward pass with AMP
                 with self.amp_context():
-                    loss = self._training_step(batch)
-                    loss = loss / grad_accum
+                    # Move batch to device
+                    batch = {k: v.to(self.device) if isinstance(v, Tensor) else v for k, v in batch.items()}
+                    
+                    outputs = self.model(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch.get("attention_mask"),
+                        labels=batch.get("labels"),
+                    )
+                    
+                    if hasattr(outputs, "loss") and outputs.loss is not None:
+                        loss = outputs.loss
+                        # If model computes loss, we need logits for accuracy/tracker
+                        logits = outputs.logits
+                        
+                        # Update trackers
+                        if hasattr(outputs, "logits"):
+                             # Explicitly calculate valid tokens for Micro-Average (consistent with rocm_sota_demo)
+                             num_tokens = (batch["labels"] != -100).sum().item()
+                             loss_tracker.update(loss, num_tokens=num_tokens)
+                             acc_tracker.update_from_logits(outputs.logits, batch["labels"])
+                    else:
+                        # Manual loss computation
+                        logits = outputs.logits
+                        labels = batch["labels"]
+                        
+                        # Shift for causal LM
+                        shift_logits = logits[..., :-1, :].contiguous()
+                        shift_labels = labels[..., 1:].contiguous()
+                        
+                        # Use tracker to compute loss and accuracy
+                        # This ensures PPL is mathematically consistent
+                        
+                        # We must use self.loss_fn for backward to respect config (Focal, etc)
+                        # But for metrics, we want standard PPL
+                        
+                        loss = self.loss_fn(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1),
+                        )
+                        
+                        # Update metrics
+                        # We use the raw loss for tracking if standard CrossEntropy
+                        num_tokens = (labels != -100).sum().item()
+                        loss_tracker.update(loss, num_tokens=num_tokens)
+                        acc_tracker.update_from_logits(logits, labels)
+
+                    # Scale for accumulation
+                    loss_scaled = loss / grad_accum
                 
                 # Backward pass
                 if self.scaler is not None:
-                    self.scaler.scale(loss).backward()
+                    self.scaler.scale(loss_scaled).backward()
                 else:
-                    loss.backward()
-                
-                epoch_loss += loss.item() * grad_accum
+                    loss_scaled.backward()
                 
                 # Optimizer step
                 if (step + 1) % grad_accum == 0:
@@ -562,13 +614,36 @@ class SOTATrainer:
                     
                     # Logging
                     if self.state.global_step % train_cfg.logging_steps == 0:
-                        avg_loss = epoch_loss / (step + 1)
+                        # Use EMA for responsive logging where possible
+                        loss_val = loss_tracker.compute_ema()
+                        if loss_val == 0.0:  # Fallback if EMA not ready
+                            loss_val = loss_tracker.compute_avg()
+                            ppl = loss_tracker.compute_ppl()
+                        else:
+                            ppl = loss_tracker.compute_ppl_ema()
+                            
+                        acc = acc_tracker.compute()
                         lr = self.scheduler.get_last_lr()[0]
+                        
+                        # ETA Calculation
+                        elapsed_time = time.time() - self.start_time
+                        avg_step_time = elapsed_time / self.state.global_step
+                        remaining_steps = num_training_steps - self.state.global_step
+                        eta_seconds = averaged_step_time * remaining_steps if 'averaged_step_time' in locals() else avg_step_time * remaining_steps
+                        eta_str = str(datetime.timedelta(seconds=int(eta_seconds)))
+                        
                         logger.info(
-                            f"Step {self.state.global_step} | "
-                            f"Loss: {avg_loss:.4f} | "
-                            f"LR: {lr:.2e}"
+                            f"Epoch {epoch+1}/{train_cfg.num_train_epochs} | "
+                            f"Step {self.state.global_step}/{num_training_steps} | "
+                            f"Loss: {loss_val:.4f} | "
+                            f"PPL: {ppl:.2f} | "
+                            f"Acc: {acc:.2%} | "
+                            f"LR: {lr:.2e} | "
+                            f"Tok/Sec: {int(num_tokens * grad_accum / (time.time() - step_start_time))} | "
+                            f"ETA: {eta_str}"
                         )
+                        # Reset accuracy for next window
+                        acc_tracker.reset()
                     
                     # Evaluation
                     if (
@@ -590,7 +665,7 @@ class SOTATrainer:
                 if train_cfg.max_steps > 0 and self.state.global_step >= train_cfg.max_steps:
                     break
             
-            metrics["train_loss"] = epoch_loss / len(train_dataloader)
+            metrics["train_loss"] = loss_tracker.compute_avg()
             logger.info(f"Epoch {epoch + 1} | Loss: {metrics['train_loss']:.4f}")
             
             # Epoch-wise evaluation

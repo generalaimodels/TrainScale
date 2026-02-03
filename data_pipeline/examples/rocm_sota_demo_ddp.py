@@ -45,6 +45,7 @@ if str(_TRAINSCALE_ROOT) not in sys.path:
 
 import yaml
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch import Tensor
 from torch.utils.data import DataLoader, DistributedSampler
@@ -71,7 +72,9 @@ from data_pipeline.trainer.distributed import (
     prepare_scheduler_for_distributed,
     log_rank_0,
     print_rank_0,
+    dist_reduce,
 )
+from data_pipeline.trainer.trainers.sota_trainer import create_trainer, SOTATrainer
 
 # Registry (model patching)
 from data_pipeline.trainer import registry
@@ -85,6 +88,9 @@ from data_pipeline.trainer.schedulers import create_sota_scheduler
 # Metrics
 from data_pipeline.trainer.metrics import MetricCollection, Perplexity, Accuracy
 
+# Data Pipeline
+from data_pipeline.pipeline import DataPipeline
+from data_pipeline.core.types import unwrap
 # ═════════════════════════════════════════════════════════════════════════════════
 # Logging Setup
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -169,358 +175,193 @@ class SOTADDPPipeline:
         self.dist_state = DistributedState.from_environment()
         
         # Initialize if not already done
-        if self.dist_state.world_size > 1 and not self.dist_state.initialized:
-            self.dist_state = DistributedState.initialize(
-                backend=config.distributed.get("backend", "nccl"),
-            )
+@dataclass
+class SOTADemo:
+    """
+    SOTA DDP Demo using SOTATrainer and DataPipeline.
+    """
+    config_path: str
+    
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self._data_pipeline = None
         
-        # Set seed for reproducibility
-        set_deterministic_seed(
-            config.training.get("seed", 42),
-            self.dist_state,
-        )
-        
-        # Components (lazy init)
-        self._model = None
-        self._tokenizer = None
-        self._optimizer = None
-        self._scheduler = None
-        self._ddp = None
+        # Initialize Distributed State (for logging/setup)
+        self.dist_state = DistributedState.initialize()
         
         log_rank_0(
-            f"SOTA DDP Pipeline initialized: "
+            f"SOTA DDP Demo initialized: "
             f"rank={self.dist_state.rank}/{self.dist_state.world_size}",
         )
-    
-    def init_model(self) -> nn.Module:
-        """Initialize model from config (registry compatible)."""
-        from transformers import AutoModelForCausalLM
-        
-        model_cfg = self.config.model
-        model_name = model_cfg.get("name_or_path", "mistralai/Mistral-7B-Instruct-v0.3")
-        
-        log_rank_0(f"Loading model: {model_name}")
-        
-        # Load model
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            trust_remote_code=model_cfg.get("trust_remote_code", True),
-            torch_dtype=getattr(torch, model_cfg.get("torch_dtype", "bfloat16")),
-            low_cpu_mem_usage=model_cfg.get("low_cpu_mem_usage", True),
-            attn_implementation=model_cfg.get("attn_implementation", "sdpa"),
-        )
-        
-        # Apply registry patches (Triton kernels)
-        registry.patch_model(model)
-        
-        # Move to device
-        model = model.to(self.dist_state.device)
-        
-        self._model = model
-        return model
-    
-    def init_tokenizer(self):
-        """Initialize tokenizer."""
-        from transformers import AutoTokenizer
-        
-        model_name = self.config.model.get("name_or_path")
-        
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            use_fast=True,
-        )
-        
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        
-        self._tokenizer = tokenizer
-        return tokenizer
-    
-    def wrap_model_with_ddp(self) -> nn.Module:
-        """Wrap model with SOTA DDP."""
-        ddp_cfg = self.config.distributed.get("ddp_config", {})
-        
-        # Create SOTA DDP from config
-        self._ddp = create_ddp(
-            bucket_cap_mb=ddp_cfg.get("bucket_cap_mb", 25),
-            gradient_compression=ddp_cfg.get("gradient_compression", "none"),
-            static_graph=ddp_cfg.get("static_graph", True),
-            find_unused_parameters=ddp_cfg.get("find_unused_parameters", False),
-        )
-        
-        # Wrap model
-        wrapped = self._ddp.wrap_model(self._model)
-        
-        log_rank_0(f"Model wrapped with SOTA DDP (bucket={ddp_cfg.get('bucket_cap_mb', 25)}MB)")
-        
-        self._model = wrapped
-        return wrapped
-    
-    def init_optimizer(self) -> torch.optim.Optimizer:
-        """Initialize SOTA optimizer from TrainScale registry."""
-        opt_cfg = self.config.optimizer
-        opt_type = opt_cfg.get("type", "adamw")
-        
-        # Get trainable parameters
-        params = [p for p in self._model.parameters() if p.requires_grad]
-        
-        log_rank_0(f"Creating SOTA optimizer: {opt_type}")
-        
-        # Use TrainScale optimizer factory
-        optimizer = create_optimizer(
-            name=opt_type,
-            params=params,
-            lr=opt_cfg.get("learning_rate", 3e-5),
-            weight_decay=opt_cfg.get("weight_decay", 0.1),
-            betas=tuple(opt_cfg.get("betas", [0.9, 0.999])),
-        )
-        
-        # Prepare for distributed (if needed)
-        optimizer = prepare_optimizer_for_distributed(
-            optimizer,
-            self._model,
-            strategy="ddp",
-        )
-        
-        self._optimizer = optimizer
-        return optimizer
-    
-    def init_scheduler(self, num_training_steps: int):
-        """Initialize SOTA scheduler from TrainScale registry."""
-        sch_cfg = self.config.scheduler
-        sch_type = sch_cfg.get("type", "cosine")
-        
-        warmup_ratio = sch_cfg.get("warmup_ratio", 0.03)
-        warmup_steps = int(warmup_ratio * num_training_steps)
-        
-        log_rank_0(f"Creating SOTA scheduler: {sch_type}")
-        
-        # Use TrainScale scheduler factory
-        scheduler = create_sota_scheduler(
-            name=sch_type,
-            optimizer=self._optimizer,
-            num_training_steps=num_training_steps,
-            warmup_steps=warmup_steps,
-            min_lr_ratio=sch_cfg.get("min_lr_ratio", 0.1),
-        )
-        
-        # Prepare for distributed
-        scheduler = prepare_scheduler_for_distributed(scheduler, self.dist_state)
-        
-        self._scheduler = scheduler
-        return scheduler
-    
-    def create_dataloader(
-        self,
-        dataset,
-        shuffle: bool = True,
-    ) -> DataLoader:
-        """Create distributed dataloader."""
-        dl_cfg = self.config.dataloader
-        
-        sampler = None
-        if self.dist_state.world_size > 1:
-            sampler = DistributedSampler(
-                dataset,
-                num_replicas=self.dist_state.world_size,
-                rank=self.dist_state.rank,
-                shuffle=shuffle,
-            )
-            shuffle = False  # Sampler handles shuffling
-        
-        return DataLoader(
-            dataset,
-            batch_size=dl_cfg.get("batch_size", 4),
-            shuffle=shuffle,
-            sampler=sampler,
-            num_workers=dl_cfg.get("num_workers", 4),
-            pin_memory=dl_cfg.get("pin_memory", True),
-            drop_last=dl_cfg.get("drop_last", True),
-        )
-    
-    def train_step(
-        self,
-        batch: Dict[str, Tensor],
-        gradient_accumulation_steps: int = 1,
-        step: int = 0,
-    ) -> Dict[str, float]:
-        """
-        Execute single training step with DDP.
-        
-        Handles:
-          - Mixed precision via autocast
-          - Gradient accumulation with no_sync
-          - SOTA gradient clipping
-          - Loss reduction across ranks
-        """
-        self._model.train()
-        
-        # Move batch to device
-        input_ids = batch["input_ids"].to(self.dist_state.device)
-        attention_mask = batch["attention_mask"].to(self.dist_state.device)
-        labels = batch["labels"].to(self.dist_state.device)
-        
-        # Determine if we should sync gradients (last accumulation step)
-        sync_context = (
-            self._ddp.no_sync()
-            if (step + 1) % gradient_accumulation_steps != 0
-            else torch.cuda.amp.autocast(enabled=False)  # Dummy context
-        )
-        
-        # Forward pass with mixed precision
-        with mixed_precision_context(enabled=True, dtype=torch.bfloat16):
-            with sync_context:
-                outputs = self._model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    labels=labels,
-                )
-                loss = outputs.loss / gradient_accumulation_steps
-        
-        # Backward pass
-        loss.backward()
-        
-        # Update weights on accumulation boundary
-        if (step + 1) % gradient_accumulation_steps == 0:
-            # Clip gradients
-            grad_norm = self._ddp.clip_grad_norm_(
-                self.config.optimizer.get("max_grad_norm", 1.0)
-            )
-            
-            # Optimizer step
-            self._optimizer.step()
-            self._scheduler.step()
-            self._optimizer.zero_grad()
-        else:
-            grad_norm = 0.0
-        
-        # Reduce loss for logging
-        loss_reduced = dist_reduce(loss.detach(), op="mean")
-        
-        return {
-            "loss": loss_reduced.item() * gradient_accumulation_steps,
-            "grad_norm": grad_norm if isinstance(grad_norm, float) else grad_norm.item(),
-            "lr": self._scheduler.get_last_lr()[0],
-        }
-    
-    def run(self, max_steps: int = 100) -> Dict[str, Any]:
-        """
-        Run complete training pipeline.
-        
-        Returns training metrics.
-        """
-        log_rank_0("═" * 60)
-        log_rank_0("Starting SOTA DDP Training")
-        log_rank_0("═" * 60)
-        
-        # Initialize components
-        self.init_tokenizer()
-        self.init_model()
-        self.wrap_model_with_ddp()
-        self.init_optimizer()
-        self.init_scheduler(max_steps)
-        
-        # Create dummy dataset for demo
-        from torch.utils.data import TensorDataset
-        
-        batch_size = self.config.dataloader.get("batch_size", 4)
-        seq_len = 512
-        vocab_size = self._tokenizer.vocab_size
-        
-        dummy_inputs = torch.randint(0, vocab_size, (batch_size * 10, seq_len))
-        dummy_labels = dummy_inputs.clone()
-        dummy_attention = torch.ones_like(dummy_inputs)
-        
-        dataset = TensorDataset(dummy_inputs, dummy_attention, dummy_labels)
-        dataloader = self.create_dataloader(dataset, shuffle=True)
-        
-        # Training loop
-        grad_accum = self.config.training.get("gradient_accumulation_steps", 4)
-        
-        start_time = time.time()
-        total_loss = 0.0
-        
-        for step, (input_ids, attention_mask, labels) in enumerate(dataloader):
-            if step >= max_steps:
-                break
-            
-            batch = {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-            }
-            
-            metrics = self.train_step(batch, grad_accum, step)
-            total_loss += metrics["loss"]
-            
-            if step % 10 == 0:
-                log_rank_0(
-                    f"Step {step}/{max_steps}: "
-                    f"loss={metrics['loss']:.4f}, "
-                    f"lr={metrics['lr']:.2e}"
-                )
-        
-        elapsed = time.time() - start_time
-        
-        results = {
-            "avg_loss": total_loss / max(step, 1),
-            "total_steps": step,
-            "elapsed_seconds": elapsed,
-            "samples_per_second": (step * batch_size) / elapsed,
-        }
-        
-        log_rank_0("═" * 60)
-        log_rank_0(f"Training Complete: avg_loss={results['avg_loss']:.4f}")
-        log_rank_0(f"Throughput: {results['samples_per_second']:.1f} samples/sec")
-        log_rank_0("═" * 60)
-        
-        return results
 
+
+    def _export_model(self, trainer, output_dir: str):
+        """Export trained model with LoRA merging."""
+        log_rank_0(f"💾 Exporting model to {output_dir}...")
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Unwrap model
+        model = trainer.model
+        if hasattr(model, "module"):
+            model = model.module
+            
+        # Merge LoRA logic
+        if self.config.export.merge_lora:
+            log_rank_0("Merging LoRA weights...")
+            try:
+                # Use internal LoRA module
+                from data_pipeline.trainer import lora
+                model = lora.merge_and_unload(model)
+                log_rank_0("✓ Merged LoRA weights via internal module")
+            except Exception as e:
+                logger.warning(f"Merge failed: {e}")
+        
+        # Save
+        model.save_pretrained(output_dir)
+        
+        # Save tokenizer from data pipeline
+        if self._data_pipeline._tokenizer_wrapper:
+            self._data_pipeline._tokenizer_wrapper.tokenizer.save_pretrained(output_dir)
+            
+        log_rank_0("Export complete.")
+
+    def _run_inference(self, model_path: str):
+        """Run sample inference on the exported model."""
+        log_rank_0(f"🚀 Running Inference Benchmark on {model_path}...")
+        
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
+            
+            # Load back for verification
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path, 
+                dtype=torch.bfloat16, 
+                device_map="cuda",
+                trust_remote_code=True
+            )
+            
+            prompts = [
+                "User: What is the capital of France?\nAssistant:",
+                "User: Write a python function to compute Fibonacci numbers.\nAssistant:",
+            ]
+            
+            for prompt in prompts:
+                log_rank_0(f"\nExample Prompt: {prompt}")
+                inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+                
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **inputs, 
+                        max_new_tokens=100, 
+                        do_sample=True, 
+                        temperature=0.7,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
+                
+                response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                log_rank_0(f"Response:\n{response}")
+                log_rank_0("-" * 40)
+                
+        except Exception as e:
+            log_rank_0(f"❌ Inference failed: {e}")
+
+    def run(self, max_steps: int = 100):
+        """Run the demo."""
+        log_rank_0("═" * 60)
+        log_rank_0("Starting SOTA DDP Training (using SOTATrainer)")
+        log_rank_0("═" * 60)
+        
+        # 1. Initialize Data Pipeline
+        log_rank_0("Initializing Data Pipeline...")
+        dp_result = DataPipeline.from_config(
+            self.config_path,
+            token=os.environ.get("HF_TOKEN"),
+            trust_remote_code=False,
+        )
+        self._data_pipeline = unwrap(dp_result)
+        
+        # 2. Create SOTA Trainer
+        log_rank_0("Initializing SOTA Trainer...")
+        trainer = create_trainer(self.config_path)
+        self.config = trainer.config # Cache config
+        
+        # Setup Model
+        log_rank_0("Setting up SOTA Model...")
+        trainer.setup_model()
+        
+        # Override config with CLI arguments
+        if max_steps > 0:
+            log_rank_0(f"Overriding max_steps: {max_steps}")
+            trainer.config.training.max_steps = max_steps
+        
+        # 3. Get Distributed DataLoader
+        batch_size = trainer.config.training.per_device_train_batch_size
+        
+        log_rank_0("Creating Distributed DataLoader...")
+        dl_result = self._data_pipeline.get_dataloader(
+            split=trainer.config.data.train_split,
+            batch_size=batch_size,
+            distributed=(self.dist_state.world_size > 1),
+            rank=self.dist_state.rank,
+            world_size=self.dist_state.world_size,
+        )
+        dataloader = unwrap(dl_result)
+        
+        # 4. Train
+        log_rank_0("Starting Training Loop...")
+        metrics = trainer.train(dataloader)
+        
+        log_rank_0("Training Complete!")
+        log_rank_0(f"Final Metrics: {metrics}")
+        
+        # 5. Export & Inference (Rank 0 only)
+        if self.dist_state.rank == 0:
+            output_dir = trainer.config.training.output_dir
+            self._export_model(trainer, output_dir)
+            self._run_inference(output_dir)
+        
+        return metrics
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # Main Entry Point
 # ═════════════════════════════════════════════════════════════════════════════════
 
 def main():
-    """Main entry point for SOTA DDP Demo."""
-    parser = argparse.ArgumentParser(
-        description="SOTA DDP Training Demo for AMD ROCm / NVIDIA Multi-GPU"
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="rocm_sota_config.yaml",
-        help="Path to YAML config file",
-    )
-    parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=100,
-        help="Maximum training steps",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Verify setup without training",
-    )
-    
+    parser = argparse.ArgumentParser(description="ROCm SOTA DDP Demo")
+    parser.add_argument("--config", type=str, default="rocm_sota_config.yaml", help="Path to YAML config")
+    parser.add_argument("--dry-run", action="store_true", help="Verify setup without training")
+    parser.add_argument("--max-steps", type=int, default=-1, help="Max training steps (default: -1, use YAML)")
     args = parser.parse_args()
     
-    # Load config
-    config = SOTADDPConfig.from_yaml(args.config)
-    
-    # Create and run pipeline
-    pipeline = SOTADDPPipeline(config)
+    # 1. Environment Setup
+    # Ensure variables are set for DDP
+    if "RANK" not in os.environ:
+        os.environ["RANK"] = "0"
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "29500"
     
     if args.dry_run:
-        log_rank_0("✅ Dry run complete. Setup verified.")
+        print("Dry run successful. Environment verified.")
         return
-    
-    results = pipeline.run(max_steps=args.max_steps)
-    
-    print_rank_0(f"\n✅ Training complete! Final loss: {results['avg_loss']:.4f}")
 
+    # 2. Run Demo
+    try:
+        demo = SOTADemo(args.config)
+        demo.run(max_steps=args.max_steps)
+        
+        # Cleanup
+        if dist.is_initialized():
+            dist.destroy_process_group()
+            
+    except Exception as e:
+        # Log error cleanly
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

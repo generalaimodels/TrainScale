@@ -199,34 +199,59 @@ class PromptEngine:
         """
         messages = []
         
-        # Add system message if present
-        if self._template.system_message:
-            messages.append({
-                "role": "system",
-                "content": self._template.system_message,
-            })
+        # Build message history
+        # Case 1: Input column is already a list of messages (e.g. UltraChat)
+        input_col = self._template.input_columns[0] if self._template.input_columns else None
         
-        # Build user message from input columns
-        user_content_parts = []
-        for col in self._template.input_columns:
-            if col in example and example[col]:
-                user_content_parts.append(str(example[col]))
+        if input_col and input_col in example and isinstance(example[input_col], list):
+            # Input is already a list of dicts
+            raw_messages = example[input_col]
+            # Validate structure
+            if raw_messages and isinstance(raw_messages[0], dict) and "role" in raw_messages[0]:
+                messages.extend(raw_messages)
+            
+            # Auto-detect label if not provided
+            if not self._template.label_column and messages:
+                last_msg = messages[-1]
+                if last_msg.get("role") == "assistant":
+                    assistant_content = last_msg.get("content", "")
+                    # Mark for slicing later
         
-        user_content = "\n".join(user_content_parts)
-        if user_content:
-            messages.append({
-                "role": "user",
-                "content": user_content,
-            })
+        else:
+            # Case 2: Standard column-to-message mapping
+            # Add system message if present
+            if self._template.system_message:
+                messages.append({
+                    "role": "system",
+                    "content": self._template.system_message,
+                })
+            
+            # Build user message from input columns
+            user_content_parts = []
+            for col in self._template.input_columns:
+                if col in example and example[col]:
+                    user_content_parts.append(str(example[col]))
+            
+            user_content = "\n".join(user_content_parts)
+            if user_content:
+                messages.append({
+                    "role": "user",
+                    "content": user_content,
+                })
+            
+            # Add assistant response if label column present
+            if self._template.label_column and self._template.label_column in example:
+                assistant_content = str(example[self._template.label_column])
+                messages.append({
+                    "role": "assistant",
+                    "content": assistant_content,
+                })
         
-        # Add assistant response if label column present
-        assistant_content = ""
-        if self._template.label_column and self._template.label_column in example:
-            assistant_content = str(example[self._template.label_column])
-            messages.append({
-                "role": "assistant",
-                "content": assistant_content,
-            })
+        # Determine assistant content for masking
+        # If we didn't extract it from label col, check if it's the last message
+        if not assistant_content and messages:
+             if messages[-1].get("role") == "assistant":
+                 assistant_content = messages[-1].get("content", "")
         
         # Use tokenizer's chat template
         tokenizer = self._tokenizer.tokenizer

@@ -174,7 +174,7 @@ class DataPipeline:
             version="1.0",
             dataset=dataset_config or DatasetConfig(name=dataset_name or ""),
             tokenizer=tokenizer_config or TokenizerConfig(name_or_path=""),
-            prompt=prompt_template,
+            prompt_template=prompt_template,
             output_schema=output_schema,
             dataloader=dataloader_config,
         )
@@ -256,7 +256,7 @@ class DataPipeline:
         tokenizer = unwrap(tokenizer_result)
         
         # Use configured template or create default
-        template = self._config.prompt or PromptTemplate()
+        template = self._config.prompt_template or PromptTemplate()
         
         self._prompt_engine = PromptEngine(
             template=template,

@@ -189,6 +189,68 @@ class DistributedState:
     num_nodes: int = 1
     device: Optional[torch.device] = None
     
+    @classmethod
+    def from_environment(cls) -> "DistributedState":
+        """Create state from environment variables."""
+        rank = int(os.environ.get("RANK", os.environ.get("SLURM_PROCID", 0)))
+        local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("SLURM_LOCALID", 0)))
+        world_size = int(os.environ.get("WORLD_SIZE", os.environ.get("SLURM_NTASKS", 1)))
+        
+        is_initialized = torch.distributed.is_initialized()
+        backend = torch.distributed.get_backend() if is_initialized else "nccl"
+        
+        if torch.cuda.is_available():
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cpu")
+            
+        return cls(
+            is_initialized=is_initialized,
+            backend=backend,
+            rank=rank,
+            local_rank=local_rank,
+            world_size=world_size,
+            device=device,
+        )
+    
+    @classmethod
+    def initialize(
+        cls,
+        backend: str = "nccl",
+        init_method: Optional[str] = None,
+    ) -> "DistributedState":
+        """Initialize distributed process group."""
+        state = cls.from_environment()
+        
+        if state.is_initialized:
+            return state
+            
+        if state.world_size > 1:
+            if not torch.distributed.is_initialized():
+                try:
+                    torch.distributed.init_process_group(
+                        backend=backend,
+                        init_method=init_method,
+                        world_size=state.world_size,
+                        rank=state.rank,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to initialize process group: {e}")
+            
+            if torch.cuda.is_available():
+                torch.cuda.set_device(state.local_rank)
+                
+            state.is_initialized = torch.distributed.is_initialized()
+            if state.is_initialized:
+                state.backend = torch.distributed.get_backend()
+                
+        return state
+    
+    @property
+    def initialized(self) -> bool:
+        """Alias for is_initialized."""
+        return self.is_initialized
+
     @property
     def is_main_process(self) -> bool:
         """Check if this is the main process (rank 0)."""

@@ -452,6 +452,12 @@ def dist_all_gather(
     
     gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
     dist.all_gather(gathered, tensor, group=process_group)
+
+    # DEBUG: Diagnose scalar warning
+    if tensor.dim() == 0:
+        # User reported warning with cat on scalars. verifying fix.
+        # logger.debug(f"dist_all_gather: detected scalar input, using stack instead of cat")
+        return torch.stack(gathered)
     
     return torch.cat(gathered, dim=0)
 
