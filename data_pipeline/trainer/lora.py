@@ -366,4 +366,12 @@ __all__ = [
     "get_lora_state_dict",
     "load_lora_weights",
     "merge_and_unload",
+    "apply_lora",
 ]
+
+def apply_lora(model: nn.Module, config: LoraConfig) -> nn.Module:
+    """
+    Apply LoRA to a model based on the provided configuration.
+    Wrapper around get_peft_model for consistency.
+    """
+    return get_peft_model(model, config)

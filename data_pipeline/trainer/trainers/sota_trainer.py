@@ -302,13 +302,9 @@ class SOTATrainer:
             return model
         
         try:
-            from data_pipeline.trainer.kernels import patch_model
-            model = patch_model(
-                model,
-                use_fused_rope=kernel_cfg.use_fused_rope,
-                use_fused_rms_norm=kernel_cfg.use_fused_rms_norm,
-                use_fused_cross_entropy=kernel_cfg.use_fused_cross_entropy,
-            )
+            from data_pipeline.trainer.registry import patch_model
+            model = patch_model(model)
+            logger.info("Applied SOTA kernel optimizations via registry")
         except ImportError:
             logger.warning("Triton kernels not available, using default implementations")
         
