@@ -31,7 +31,9 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch import Tensor
+from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
+import torch.distributed as dist
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # Internal Imports
@@ -623,8 +625,9 @@ class SOTATrainer:
                     self.optimizer.zero_grad()
                     self.state.global_step += 1
                     
-                    # Logging
-                    if self.state.global_step % train_cfg.logging_steps == 0:
+                    # Logging (Rank 0 only)
+                    is_main = not dist.is_initialized() or dist.get_rank() == 0
+                    if self.state.global_step % train_cfg.logging_steps == 0 and is_main:
                         # Use EMA for responsive logging where possible
                         loss_val = loss_tracker.compute_ema()
                         if loss_val == 0.0:  # Fallback if EMA not ready

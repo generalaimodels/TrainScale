@@ -1,21 +1,8 @@
 # ════════════════════════════════════════════════════════════════════════════════
-# SOTA Training Configuration - AMD ROCm MI300X Multi-GPU
+# SOTA Training Configuration - AMD ROCm MI300X Multi-GPU (FULL FINE-TUNE)
 # ════════════════════════════════════════════════════════════════════════════════
-# Complete end-to-end SOTA training configuration for AMD MI300X GPUs.
-# Uses 4 middle GPUs (2,3,4,5) from 8 available.
-# Full YAML-driven, no hardcoding.
-#
-# Hardware: 8x AMD Instinct MI300X OAM (192GB HBM3 each)
-# Target SOTA Model: Mistral-7B-Instruct-v0.3 / Llama-3.1-8B-Instruct
-#
-# FEATURES (Above Unsloth Level):
-# ═══════════════════════════════════════
-# • Training: LoRA, QLoRA, Full Fine-tune
-# • Optimizers: AdamW, Lion, CAME, SophiaG, Prodigy
-# • Schedulers: WSD (LLaMA-3 style), Cosine, REX
-# • Kernels: Flash Attention 2, Fused RMSNorm, Fused Cross-Entropy
-# • Multi-GPU: DDP with 4 GPUs
-# • Precision: BF16 (MI300X native support)
+# Full Fine-Tuning configuration (LoRA Disabled).
+# Uses 4 GPUs.
 # ════════════════════════════════════════════════════════════════════════════════
 
 config_version: "2.0"
@@ -27,36 +14,27 @@ version: "1.0"
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # Training Mode - USER CONTROL
-# Options:
-#   - "lora": Enable LoRA (uses 'lora' section below)
-#   - "full": Full Fine-Tuning (ignores 'lora' section)
-#   - "qlora": Quantized LoRA (uses 'quantization' + 'lora')
 # ═════════════════════════════════════════════════════════════════════════════════
-training_mode: "lora"  # <--- CHANGE THIS to "full" to disable LoRA
+training_mode: "full"  # <--- FULL FINE-TUNING ENABLED
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# Model Configuration - SOTA 7B/8B Models
+# Model Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 model:
-  # Choose SOTA model:
-  # - "mistralai/Mistral-7B-Instruct-v0.3"
-  # - "meta-llama/Llama-3.1-8B-Instruct"
-  # - "Qwen/Qwen2.5-7B-Instruct"
-  # - "google/gemma-2-9b-it"
   name_or_path: "mistralai/Mistral-7B-Instruct-v0.3"
   revision: "main"
   trust_remote_code: true
-  torch_dtype: "bfloat16"  # MI300X native BF16 support
+  torch_dtype: "bfloat16"
   low_cpu_mem_usage: true
   use_flash_attention_2: false
-  attn_implementation: "sdpa"  # SOTA for ROCm (uses CK/Triton)
-  max_position_embeddings: null  # Use model default (32K for Mistral)
+  attn_implementation: "sdpa"
+  max_position_embeddings: null
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # Tokenizer Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 tokenizer:
-  name_or_path: "mistralai/Mistral-7B-Instruct-v0.3"  # Use model path
+  name_or_path: "mistralai/Mistral-7B-Instruct-v0.3"
   use_fast: true
   padding_side: "right"
   truncation_side: "right"
@@ -69,12 +47,6 @@ tokenizer:
 # Dataset Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 dataset:
-  # SOTA datasets:
-  # - "tatsu-lab/alpaca" (52K instruction dataset)
-  # - "WizardLM/WizardLM_evol_instruct_V2_196k"
-  # - "Open-Orca/OpenOrca" (1M entries)
-  # - "TIGER-Lab/MathInstruct" (Math reasoning)
-  # - "microsoft/orca-math-word-problems-200k"
   name: "HuggingFaceH4/ultrachat_200k"
   config_name: null
   streaming: false
@@ -84,7 +56,7 @@ dataset:
     train:
       name: "train_sft"
       alias: "training"
-      sample_size: 1000 # Start with 100 for rapid demo testing
+      sample_size: 1000
       shuffle: true
       seed: 42
     validation:
@@ -115,24 +87,19 @@ introspection:
 # Prompt Template Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 prompt_template:
-  format_type: "chat"  # chat, completion, custom
-  
-  # Mistral chat format
+  format_type: "chat"
   system_message: "You are a helpful, respectful and honest AI assistant."
   user_template: "{{ content }}"
   assistant_template: "{{ content }}"
-  
-  # Column roles for chat-based datasets
   input_columns:
     - "messages"
-  label_column: null  # Not used for chat format
-  
+  label_column: null
   mask_input: true
   add_bos: true
   add_eos: true
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# Preprocessing Configuration (SOTA)
+# Preprocessing Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 preprocessing:
   length_manager:
@@ -140,7 +107,6 @@ preprocessing:
     max_total_length: 4096
     padding_strategy: "longest"
     truncation_strategy: "smart"
-    
     per_column_limits:
       instruction: 2000
       input: 2000
@@ -191,31 +157,24 @@ dataloader:
   persistent_workers: true
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# LoRA Configuration (SOTA: RSLoRA, DoRA)
+# LoRA Configuration (DISABLED)
 # ═════════════════════════════════════════════════════════════════════════════════
 lora:
-  enabled: true
-  r: 64                     # Rank 64 for SOTA performance
-  lora_alpha: 128           # Alpha = 2*r for stable training
+  enabled: false  # <--- DISABLED
+  r: 64
+  lora_alpha: 128
   lora_dropout: 0.05
-  target_modules:
-    - "q_proj"
-    - "k_proj"
-    - "v_proj"
-    - "o_proj"
-    - "gate_proj"
-    - "up_proj"
-    - "down_proj"
+  target_modules: ["q_proj", "v_proj"]
   bias: "none"
-  use_rslora: true          # Rank-Stabilizing LoRA (SOTA)
-  use_dora: false           # Weight-Decomposed LoRA
+  use_rslora: true
+  use_dora: false
   rank_pattern: {}
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# Quantization Configuration (For QLoRA mode)
+# Quantization Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 quantization:
-  enabled: false  # Set true for QLoRA mode
+  enabled: false
   load_in_4bit: true
   load_in_8bit: false
   load_in_fp8: false
@@ -225,128 +184,103 @@ quantization:
   llm_int8_threshold: 6.0
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# Optimizer Configuration (SOTA: Lion, CAME, Prodigy)
+# Optimizer Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 optimizer:
-  # SOTA optimizers: lion, came, sophia, prodigy, adam8bit
-  type: "adamw"             # Standard AdamW (Most Stable)
-  learning_rate: 2.0e-5     # Safe LR
-  weight_decay: 0.01        # Standard decay
-  betas: [0.9, 0.999]       # For AdamW
+  type: "adamw"             # Standard AdamW
+  learning_rate: 1.0e-5     # Slightly lower LR for Full Fine-Tuning
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
   eps: 1.0e-8
   max_grad_norm: 1.0
-  # Lion specific
-  lion_betas: [0.95, 0.98]  # Lion-specific betas
-  # 8-bit specific
   percentile_clipping: 100.0
   block_wise: true
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# Scheduler Configuration (SOTA: WSD, REX)
+# Scheduler Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 scheduler:
-  # SOTA schedulers: wsd, rex, cosine_restarts
-  type: "cosine"            # Standard Cosine for stability
+  type: "cosine"
   warmup_steps: 0
-  warmup_ratio: 0.1         # 10% warmup for gentle start
-  min_lr_ratio: 0.1         # Decay to 10% of peak LR
-  # WSD specific
-  stable_ratio: 0.85        # 85% stable phase
-  decay_type: "cosine"      # cosine, linear, inverse_sqrt
-  # Polynomial
+  warmup_ratio: 0.1
+  min_lr_ratio: 0.1
+  stable_ratio: 0.85
+  decay_type: "cosine"
   power: 1.0
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# Loss Configuration (SOTA: Chunked CE, Z-Loss)
+# Loss Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 loss:
-  type: "chunked_ce"        # Memory-efficient chunked cross-entropy
+  type: "chunked_ce"
   ignore_index: -100
   label_smoothing: 0.0
   reduction: "mean"
-  chunk_size: 32768         # 32K chunk for memory efficiency
-  # Focal loss
+  chunk_size: 32768
   focal_gamma: 2.0
   focal_alpha: 0.25
-  # DPO (for RL mode)
   dpo_beta: 0.1
-  # Distillation
   temperature: 2.0
   alpha: 0.5
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# RL Configuration (GRPO, DrGRPO, DAPO - 80% VRAM reduction)
+# RL Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 rl:
   enabled: false
-  algorithm: "grpo"
-  num_generations: 4
-  temperature: 0.7
-  kl_coef: 0.01
-  gamma: 1.0
-  clip_range: 0.2
-  reward_clip: 10.0
-  use_length_penalty: false
-  length_penalty_alpha: 1.0
-  use_ref_model: true
-  ref_model_sync_steps: 100
-  use_vllm: false
-  vllm_gpu_memory_utilization: 0.9
-  group_size: 8
-  dapo_delta: 0.1
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # Export Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 export:
   enabled: true
-  output_dir: "./outputs/rocm_sota_export"
-  format: "safetensors"     # safetensors, gguf_q4_k_m, gguf_q8_0, vllm
+  output_dir: "./outputs/rocm_sota_full_export"
+  format: "safetensors"
   push_to_hub: false
   hub_model_id: null
   hub_token: null
   hub_private: false
-  merge_lora: true
+  merge_lora: false  # No LoRA to merge
   save_merged_16bit: true
   gguf_quantization: "q4_k_m"
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# Distributed Configuration - Multi-GPU DDP (4 GPUs)
+# Distributed Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 distributed:
   enabled: true
-  backend: "nccl"           # ROCm uses NCCL-compatible RCCL
-  strategy: "ddp"           # ddp, fsdp, deepspeed
-  world_size: 4             # Use 4 GPUs
+  backend: "nccl"
+  strategy: "ddp"
+  world_size: 4
   gradient_checkpointing: true
   gradient_checkpointing_use_reentrant: false
   fsdp_config: {}
   deepspeed_config: null
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# Hardware Configuration - AMD MI300X (ROCm)
+# Hardware Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 hardware:
-  device: "cuda"            # ROCm uses CUDA-compatible API
-  device_id: 0              # Base device ID (uses 2,3,4,5 via CUDA_VISIBLE_DEVICES)
-  precision: "bf16"         # MI300X has native BF16 support
-  tf32: false               # Not applicable for AMD
-  compile_model: false      # torch.compile() - experimental on ROCm
+  device: "cuda"
+  device_id: 0
+  precision: "bf16"
+  tf32: false
+  compile_model: false
   compile_mode: "reduce-overhead"
   num_workers: 4
   pin_memory: true
   prefetch_factor: 2
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# Kernel Configuration (Triton-fused ops)
+# Kernel Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 kernels:
-  use_triton: true          # Triton supported on ROCm
-  use_flash_attention: true # Flash Attention 2 for ROCm
+  use_triton: true
+  use_flash_attention: true
   use_fused_rope: true
   use_fused_rms_norm: true
   use_fused_cross_entropy: true
-  use_fused_lora: true
+  use_fused_lora: false  # Disabled for Full FT
   use_moe_kernels: true
   autotune: true
   activation_checkpointing: true
@@ -359,7 +293,7 @@ data:
   dataset_name: "HuggingFaceH4/ultrachat_200k"
   dataset_config: null
   streaming: false
-  max_samples: 10000        # 10K samples for demo
+  max_samples: 10000
   train_split: "train_sft"
   eval_split: "test_sft"
   text_column: "messages"
@@ -373,12 +307,12 @@ data:
 # Training Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 training:
-  output_dir: "./outputs/rocm_sota_run"
-  num_train_epochs: 1       # 1 epoch for demo
-  max_steps: 500            # Limit to 500 steps for demo
+  output_dir: "./outputs/rocm_sota_full_run"
+  num_train_epochs: 1
+  max_steps: 500
   per_device_train_batch_size: 4
   per_device_eval_batch_size: 8
-  gradient_accumulation_steps: 4  # Effective batch = 4*4*4 = 64
+  gradient_accumulation_steps: 4
   eval_strategy: "epochs"
   eval_steps: 10
   save_strategy: "epochs"
@@ -387,3 +321,5 @@ training:
   logging_steps: 10
   seed: 42
   resume_from_checkpoint: null
+  early_stopping_patience: 3
+  early_stopping_threshold: 0.01
