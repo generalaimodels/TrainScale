@@ -47,69 +47,78 @@ DEFAULT_BLOCK_SIZE = 128
 if _TRITON_AVAILABLE:
     
     @triton.jit
-    def _activation_quant_kernel(
+    def _block_quant_kernel(
         x_ptr,
         y_ptr,
         s_ptr,
-        n_elements,
-        BLOCK_SIZE: tl.constexpr,
+        M, N,
+        stride_xm, stride_xn,
+        stride_ym, stride_yn,
+        stride_sm, stride_sn,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
     ):
         """
-        Quantize activation to FP8 with per-block scaling.
-        
-        For each block:
-        1. Find max absolute value
-        2. Compute scale = max_abs / 448.0
-        3. Quantize: y = x / scale
+        DeepSeek-V3 style block-wise quantization to FP8.
+        Computes scale = max(abs(block)) / 448.0
         """
-        block_idx = tl.program_id(0)
-        offs = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = offs < n_elements
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
         
-        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
         
-        # Compute scale from max absolute value
-        max_abs = tl.max(tl.abs(x), 0)
-        scale = max_abs / 448.0
-        # Handle zero case
-        scale = tl.where(scale == 0.0, 1.0, scale)
+        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        
+        # Load block
+        x = tl.load(x_ptr + offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn, mask=mask, other=0.0).to(tl.float32)
+        
+        # Compute max abs in block
+        max_val = tl.max(tl.abs(x))
+        scale = max_val / 448.0
+        scale = tl.where(scale == 0, 1.0, scale)
         
         # Quantize
         y = x / scale
         y = y.to(y_ptr.dtype.element_ty)
         
-        tl.store(y_ptr + offs, y, mask=mask)
-        tl.store(s_ptr + block_idx, scale)
-    
-    
+        # Store
+        tl.store(y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn, y, mask=mask)
+        tl.store(s_ptr + pid_m * stride_sm + pid_n * stride_sn, scale)
+
+
     @triton.jit
-    def _weight_dequant_kernel(
-        x_ptr,
-        s_ptr,
+    def _block_dequant_kernel(
         y_ptr,
-        M,
-        N,
-        BLOCK_SIZE: tl.constexpr,
+        s_ptr,
+        x_ptr,
+        M, N,
+        stride_ym, stride_yn,
+        stride_sm, stride_sn,
+        stride_xm, stride_xn,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
     ):
         """
-        Dequantize FP8 weights with block-wise scaling.
-        
-        y = x * scale
+        Block-wise dequantization from FP8.
         """
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
-        n_blocks = tl.cdiv(N, BLOCK_SIZE)
         
-        offs_m = pid_m * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        offs_n = pid_n * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        offs = offs_m[:, None] * N + offs_n[None, :]
+        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        
         mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
         
-        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        s = tl.load(s_ptr + pid_m * n_blocks + pid_n)
+        # Load scale for this block
+        scale = tl.load(s_ptr + pid_m * stride_sm + pid_n * stride_sn)
         
-        y = x * s
-        tl.store(y_ptr + offs, y.to(y_ptr.dtype.element_ty), mask=mask)
+        # Load quantized block
+        y = tl.load(y_ptr + offs_m[:, None] * stride_ym + offs_n[None, :] * stride_yn, mask=mask, other=0.0).to(tl.float32)
+        
+        # Dequantize
+        x = y * scale
+        
+        # Store
+        tl.store(x_ptr + offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn, x.to(x_ptr.dtype.element_ty), mask=mask)
 
 
     @triton.jit
@@ -190,36 +199,46 @@ if _TRITON_AVAILABLE:
 
 def activation_quant(x: Tensor, block_size: int = 128) -> Tuple[Tensor, Tensor]:
     """
-    Quantize activation to FP8 with per-block scaling.
+    Quantize activation to FP8 with per-block scaling (DeepSeek-V3 style).
     
     Returns (quantized_x, scales)
     """
     if not _TRITON_AVAILABLE or not x.is_cuda:
         # Fallback to PyTorch
-        x_flat = x.view(-1, x.size(-1))
-        n_blocks = x_flat.numel() // block_size
-        x_reshaped = x_flat.view(n_blocks, block_size)
-        scales = x_reshaped.abs().max(dim=1).values / E4M3_MAX
+        M, N = x.shape
+        n_blocks_m = triton.cdiv(M, block_size)
+        n_blocks_n = triton.cdiv(N, block_size)
+        
+        # Reshape to blocks
+        x_reshaped = x.view(n_blocks_m, block_size, n_blocks_n, block_size).permute(0, 2, 1, 3).reshape(-1, block_size, block_size)
+        scales = x_reshaped.abs().max(dim=-1).values.max(dim=-1).values / E4M3_MAX
         scales = torch.where(scales == 0, torch.ones_like(scales), scales)
-        x_quant = x_reshaped / scales[:, None]
-        return x_quant.to(torch.float8_e4m3fn).view_as(x), scales
+        
+        # Scale and quantize
+        x_quant = x.view(n_blocks_m, block_size, n_blocks_n, block_size).permute(0, 2, 1, 3) / scales[:, :, None, None]
+        return x_quant.permute(0, 2, 1, 3).reshape(M, N).to(torch.float8_e4m3fn), scales.view(n_blocks_m, n_blocks_n)
     
-    assert x.size(-1) % block_size == 0
+    M, N = x.shape
     x = x.contiguous()
-    n_elements = x.numel()
-    n_blocks = n_elements // block_size
+    n_blocks_m = triton.cdiv(M, block_size)
+    n_blocks_n = triton.cdiv(N, block_size)
     
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    s = torch.empty(n_blocks, dtype=torch.float32, device=x.device)
+    s = torch.empty((n_blocks_m, n_blocks_n), dtype=torch.float32, device=x.device)
     
-    _activation_quant_kernel[(n_blocks,)](
-        x, y, s, n_elements, BLOCK_SIZE=block_size,
+    grid = (n_blocks_m, n_blocks_n)
+    _block_quant_kernel[grid](
+        x, y, s, M, N,
+        x.stride(0), x.stride(1),
+        y.stride(0), y.stride(1),
+        s.stride(0), s.stride(1),
+        BLOCK_SIZE_M=block_size, BLOCK_SIZE_N=block_size,
     )
     return y, s
 
 
 def weight_dequant(
-    x: Tensor,
+    y: Tensor,
     s: Tensor,
     block_size: int = 128,
     dtype: torch.dtype = torch.bfloat16,
@@ -227,22 +246,25 @@ def weight_dequant(
     """
     Dequantize FP8 weights with block-wise scaling.
     """
-    if s.shape[1] == 1:
-        # Row-quantized: simple multiply
-        return (x.to(dtype) * s.to(dtype))
-    
-    if not _TRITON_AVAILABLE or not x.is_cuda:
+    if not _TRITON_AVAILABLE or not y.is_cuda:
         # Fallback
-        return (x.to(dtype) * s.to(dtype))
+        M, N = y.shape
+        n_blocks_m, n_blocks_n = s.shape
+        y_deq = y.to(dtype).view(n_blocks_m, block_size, n_blocks_n, block_size).permute(0, 2, 1, 3) * s[:, :, None, None].to(dtype)
+        return y_deq.permute(0, 2, 1, 3).reshape(M, N)
     
-    M, N = x.shape
-    y = torch.empty((M, N), dtype=dtype, device=x.device)
+    M, N = y.shape
+    x = torch.empty((M, N), dtype=dtype, device=y.device)
     
-    grid = (triton.cdiv(M, block_size), triton.cdiv(N, block_size))
-    _weight_dequant_kernel[grid](
-        x, s, y, M, N, BLOCK_SIZE=block_size,
+    grid = (s.shape[0], s.shape[1])
+    _block_dequant_kernel[grid](
+        y, s, x, M, N,
+        y.stride(0), y.stride(1),
+        s.stride(0), s.stride(1),
+        x.stride(0), x.stride(1),
+        BLOCK_SIZE_M=block_size, BLOCK_SIZE_N=block_size,
     )
-    return y
+    return x
 
 
 # ═════════════════════════════════════════════════════════════════════════════════

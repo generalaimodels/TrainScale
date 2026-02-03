@@ -203,7 +203,8 @@ if _TRITON_AVAILABLE:
                         w = tl.load(w_ptrs, mask=offs_n[:, None] < N, other=0.0)
                         
                         # Accumulate
-                        acc += tl.dot(x, w.T)
+                        # Accumulate with TF32 precision
+                        acc += tl.dot(x, w.T, allow_tf32=True)
                         
                         x_ptrs += BLOCK_SIZE_K
                         w_ptrs += BLOCK_SIZE_K
@@ -316,7 +317,7 @@ if _TRITON_AVAILABLE:
                         dY = tl.load(dY_ptrs, mask=row_mask[:, None] & (offs_n[None, :] < N), other=0.0)
                         w = tl.load(w_ptrs, mask=(offs_n[:, None] < N) & (offs_k[None, :] < K), other=0.0)
                         
-                        acc += tl.dot(dY, w)
+                        acc += tl.dot(dY, w, allow_tf32=True)
                         
                         dY_ptrs += BLOCK_SIZE_N
                         offs_n += BLOCK_SIZE_N
@@ -432,7 +433,7 @@ if _TRITON_AVAILABLE:
                         )
                         
                         # dW += dY.T @ X
-                        acc += tl.dot(dY.T, x)
+                        acc += tl.dot(dY.T, x, allow_tf32=True)
                     
                     # Store
                     dw = acc.to(output_dtype)

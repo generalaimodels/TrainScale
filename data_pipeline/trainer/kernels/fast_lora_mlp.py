@@ -20,6 +20,20 @@ from torch import Tensor
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
+# Triton Setup
+# ═════════════════════════════════════════════════════════════════════════════════
+
+_TRITON_AVAILABLE = False
+try:
+    import triton
+    import triton.language as tl
+    _TRITON_AVAILABLE = torch.cuda.is_available()
+except ImportError:
+    triton = None
+    tl = None
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
 # AMP Custom Decorators
 # ═════════════════════════════════════════════════════════════════════════════════
 
@@ -43,6 +57,220 @@ def torch_amp_custom_bwd(fn):
 # LoRA Matmul Helper
 # ═════════════════════════════════════════════════════════════════════════════════
 
+# ═════════════════════════════════════════════════════════════════════════════════
+# Triton LoRA Kernels
+# ═════════════════════════════════════════════════════════════════════════════════
+
+if _TRITON_AVAILABLE:
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+            triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=4, num_warps=4),
+        ],
+        key=['M', 'N', 'K'],
+    )
+    @triton.jit
+    def _lora_matmul_fwd_kernel(
+        X_ptr, W_ptr, A_ptr, B_ptr, Out_ptr,
+        M, N, K, R,
+        stride_xm, stride_xk,
+        stride_wn, stride_wk,
+        stride_ar, stride_ak,
+        stride_bn, stride_br,
+        stride_om, stride_on,
+        scaling,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+        BLOCK_SIZE_R: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
+    ):
+        """
+        Fused LoRA Matmul Kernel: Out = X @ W.T + scaling * (X @ A.T @ B.T)
+        """
+        pid = tl.program_id(0)
+        num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + (pid % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+        x_ptrs = X_ptr + (offs_am[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+        w_ptrs = W_ptr + (offs_bn[None, :] * stride_wn + offs_k[:, None] * stride_wk)
+        
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            mask = offs_k[None, :] < K - k * BLOCK_SIZE_K
+            x = tl.load(x_ptrs, mask=mask, other=0.0)
+            # Load weights with eviction hint for streaming data
+            w = tl.load(w_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0, eviction_policy="evict_first")
+            # Force TF32 for Ampere+ Tensor Cores
+            acc += tl.dot(x, w, allow_tf32=True)
+            x_ptrs += BLOCK_SIZE_K * stride_xk
+            w_ptrs += BLOCK_SIZE_K * stride_wk
+
+        lora_acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_R), dtype=tl.float32)
+        a_ptrs = A_ptr + (tl.arange(0, BLOCK_SIZE_R)[None, :] * stride_ar + offs_k[:, None] * stride_ak)
+        x_ptrs = X_ptr + (offs_am[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+        
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            mask = offs_k[None, :] < K - k * BLOCK_SIZE_K
+            x = tl.load(x_ptrs, mask=mask, other=0.0)
+            a = tl.load(a_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            lora_acc += tl.dot(x, a, allow_tf32=True)
+            x_ptrs += BLOCK_SIZE_K * stride_xk
+            a_ptrs += BLOCK_SIZE_K * stride_ak
+        
+        b_ptrs = B_ptr + (offs_bn[None, :] * stride_bn + tl.arange(0, BLOCK_SIZE_R)[:, None] * stride_br)
+        acc += tl.dot(lora_acc.to(A_ptr.dtype.element_ty), b_ptrs.to(A_ptr.dtype.element_ty), allow_tf32=True) * scaling
+
+        offs_om = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_on = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        out_ptrs = Out_ptr + stride_om * offs_om[:, None] + stride_on * offs_on[None, :]
+        mask = (offs_om[:, None] < M) & (offs_on[None, :] < N)
+        tl.store(out_ptrs, acc.to(Out_ptr.dtype.element_ty), mask=mask)
+
+
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=3, num_warps=8),
+        ],
+        key=['M', 'N', 'K'],
+    )
+    @triton.jit
+    def _lora_matmul_fwd_swiglu_kernel(
+        X_ptr, W_gate_ptr, A_gate_ptr, B_gate_ptr,
+        W_up_ptr, A_up_ptr, B_up_ptr,
+        Out_ptr,
+        M, N, K, R,
+        stride_xm, stride_xk,
+        stride_wn, stride_wk,
+        stride_ar, stride_ak,
+        stride_bn, stride_br,
+        stride_om, stride_on,
+        scaling,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
+        BLOCK_SIZE_R: tl.constexpr,
+        GROUP_SIZE_M: tl.constexpr,
+    ):
+        """
+        Fused LoRA Matmul + SwiGLU Kernel.
+        Computes SwiGLU(X@W_gate + ... , X@W_up + ...) for feed-forward networks.
+        """
+        pid = tl.program_id(0)
+        num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+        num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
+        num_pid_in_group = GROUP_SIZE_M * num_pid_n
+        group_id = pid // num_pid_in_group
+        first_pid_m = group_id * GROUP_SIZE_M
+        group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+        pid_m = first_pid_m + (pid % group_size_m)
+        pid_n = (pid % num_pid_in_group) // group_size_m
+
+        offs_am = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+        offs_bn = (pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)) % N
+        offs_k = tl.arange(0, BLOCK_SIZE_K)
+
+        x_ptrs = X_ptr + (offs_am[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+        w_gate_ptrs = W_gate_ptr + (offs_bn[None, :] * stride_wn + offs_k[:, None] * stride_wk)
+        w_up_ptrs = W_up_ptr + (offs_bn[None, :] * stride_wn + offs_k[:, None] * stride_wk)
+        
+        acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            mask_k = offs_k[None, :] < K - k * BLOCK_SIZE_K
+            x = tl.load(x_ptrs, mask=mask_k, other=0.0)
+            w_gate = tl.load(w_gate_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0, eviction_policy="evict_first")
+            w_up = tl.load(w_up_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0, eviction_policy="evict_first")
+            acc_gate += tl.dot(x, w_gate, allow_tf32=True)
+            acc_up += tl.dot(x, w_up, allow_tf32=True)
+            x_ptrs += BLOCK_SIZE_K * stride_xk
+            w_gate_ptrs += BLOCK_SIZE_K * stride_wk
+            w_up_ptrs += BLOCK_SIZE_K * stride_wk
+
+        # LoRA Paths for gate and up
+        lora_acc_gate = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_R), dtype=tl.float32)
+        lora_acc_up = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_R), dtype=tl.float32)
+        a_gate_ptrs = A_gate_ptr + (tl.arange(0, BLOCK_SIZE_R)[None, :] * stride_ar + offs_k[:, None] * stride_ak)
+        a_up_ptrs = A_up_ptr + (tl.arange(0, BLOCK_SIZE_R)[None, :] * stride_ar + offs_k[:, None] * stride_ak)
+        x_ptrs = X_ptr + (offs_am[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+        
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            mask_k = offs_k[None, :] < K - k * BLOCK_SIZE_K
+            x = tl.load(x_ptrs, mask=mask_k, other=0.0)
+            a_gate = tl.load(a_gate_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            a_up = tl.load(a_up_ptrs, mask=offs_k[:, None] < K - k * BLOCK_SIZE_K, other=0.0)
+            lora_acc_gate += tl.dot(x, a_gate, allow_tf32=True)
+            lora_acc_up += tl.dot(x, a_up, allow_tf32=True)
+            x_ptrs += BLOCK_SIZE_K * stride_xk
+            a_gate_ptrs += BLOCK_SIZE_K * stride_ak
+            a_up_ptrs += BLOCK_SIZE_K * stride_ak
+        
+        b_gate_ptrs = B_gate_ptr + (offs_bn[None, :] * stride_bn + tl.arange(0, BLOCK_SIZE_R)[:, None] * stride_br)
+        b_up_ptrs = B_up_ptr + (offs_bn[None, :] * stride_bn + tl.arange(0, BLOCK_SIZE_R)[:, None] * stride_br)
+        
+        acc_gate += tl.dot(lora_acc_gate.to(A_gate_ptr.dtype.element_ty), b_gate_ptrs.to(A_gate_ptr.dtype.element_ty), allow_tf32=True) * scaling
+        acc_up += tl.dot(lora_acc_up.to(A_up_ptr.dtype.element_ty), b_up_ptrs.to(A_up_ptr.dtype.element_ty), allow_tf32=True) * scaling
+
+        # Apply SwiGLU: SiLU(gate) * up
+        # SiLU(x) = x * sigmoid(x)
+        res = (acc_gate * tl.sigmoid(acc_gate)) * acc_up
+
+        offs_om = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_on = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        out_ptrs = Out_ptr + stride_om * offs_om[:, None] + stride_on * offs_on[None, :]
+        mask = (offs_om[:, None] < M) & (offs_on[None, :] < N)
+        tl.store(out_ptrs, res.to(Out_ptr.dtype.element_ty), mask=mask)
+
+
+    @triton.jit
+    def _swiglu_bwd_kernel(
+        dY_ptr, Gate_ptr, Up_ptr, dGate_ptr, dUp_ptr,
+        M, N,
+        stride_dm, stride_dn,
+        stride_gm, stride_gn,
+        stride_um, stride_un,
+        stride_dgm, stride_dgn,
+        stride_dum, stride_dun,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+    ):
+        """
+        Backward pass for SwiGLU: SiLU(gate) * up
+        dGate = dY * up * d_SiLU(gate)
+        dUp = dY * SiLU(gate)
+        """
+        pid_m = tl.program_id(0)
+        pid_n = tl.program_id(1)
+        
+        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+        offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+        
+        mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+        
+        dY = tl.load(dY_ptr + offs_m[:, None] * stride_dm + offs_n[None, :] * stride_dn, mask=mask, other=0.0).to(tl.float32)
+        gate = tl.load(Gate_ptr + offs_m[:, None] * stride_gm + offs_n[None, :] * stride_gn, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(Up_ptr + offs_m[:, None] * stride_um + offs_n[None, :] * stride_un, mask=mask, other=0.0).to(tl.float32)
+        
+        # d_SiLU(x) = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
+        sig = tl.sigmoid(gate)
+        silu = gate * sig
+        d_silu = sig * (1.0 + gate * (1.0 - sig))
+        
+        d_gate = dY * up * d_silu
+        d_up = dY * silu
+        
+        tl.store(dGate_ptr + offs_m[:, None] * stride_dgm + offs_n[None, :] * stride_dgn, d_gate.to(dGate_ptr.dtype.element_ty), mask=mask)
+        tl.store(dUp_ptr + offs_m[:, None] * stride_dum + offs_n[None, :] * stride_dun, d_up.to(dUp_ptr.dtype.element_ty), mask=mask)
+
+
 def matmul_lora(
     X: Tensor,
     W: Tensor,
@@ -52,10 +280,41 @@ def matmul_lora(
     scaling: float,
 ) -> Tensor:
     """
-    Optimized LoRA matmul: Y = X @ W + scaling * (X @ A.T) @ B.T
+    Optimized LoRA matmul: Y = X @ W.T + scaling * (X @ A.T) @ B.T
     
-    Handles quantized base weights and optional LoRA adapters.
+    Uses high-performance Triton kernel if available.
     """
+    if X.dim() == 3:
+        batch, seq, d_in = X.shape
+        X_flat = X.view(-1, d_in)
+    else:
+        X_flat = X
+    
+    M, K = X_flat.shape
+    N = W.shape[0]
+
+    # Triton path for LoRA if available and base weight is not quantized
+    if _TRITON_AVAILABLE and X.is_cuda and A is not None and B is not None and W_quant is None:
+        R = A.shape[0]
+        out = torch.empty((M, N), device=X.device, dtype=X.dtype)
+        
+        grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+        
+        _lora_matmul_fwd_kernel[grid](
+            X_flat, W, A, B, out,
+            M, N, K, R,
+            X_flat.stride(0), X_flat.stride(1),
+            W.stride(0), W.stride(1),
+            A.stride(0), A.stride(1),
+            B.stride(0), B.stride(1),
+            out.stride(0), out.stride(1),
+            scaling,
+            BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=32,
+            BLOCK_SIZE_R=triton.next_power_of_2(R),
+            GROUP_SIZE_M=8,
+        )
+        return out.view(*X.shape[:-1], N)
+
     # Dequantize if needed
     if W_quant is not None:
         try:
@@ -69,7 +328,6 @@ def matmul_lora(
     
     # Add LoRA if present
     if A is not None and B is not None:
-        # (X @ A.T) @ B.T where A: [r, in], B: [out, r]
         lora_out = (X @ A.t()) @ B.t()
         result = result + scaling * lora_out
     
@@ -164,13 +422,40 @@ class LoRA_MLP(torch.autograd.Function):
         inplace: bool = True,
     ) -> Tensor:
         dtype = X.dtype
+        M, K = X.view(-1, X.shape[-1]).shape
         
-        # Compute gate and up projections with LoRA
-        e = matmul_lora(X, gateW, gateW_quant, gateA, gateB, gateS)
-        g = matmul_lora(X, upW, upW_quant, upA, upB, upS)
+        # Determine if we can use fused swiglu
+        can_use_fused = (_TRITON_AVAILABLE and X.is_cuda and gateW_quant is None and upW_quant is None 
+                        and gateA is not None and gateB is not None and upA is not None and upB is not None)
         
-        # Apply activation (SwiGLU)
-        h = forward_fn(e, g)
+        if can_use_fused:
+            N = gateW.shape[0]
+            R = gateA.shape[0]
+            h = torch.empty((M, N), device=X.device, dtype=X.dtype)
+            grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']), )
+            
+            _lora_matmul_fwd_swiglu_kernel[grid](
+                X.view(-1, K), gateW, gateA, gateB,
+                upW, upA, upB,
+                h,
+                M, N, K, R,
+                X.stride(0) if X.dim()==2 else X.stride(1), X.stride(-1),
+                gateW.stride(0), gateW.stride(1),
+                gateA.stride(0), gateA.stride(1),
+                gateB.stride(0), gateB.stride(1),
+                h.stride(0), h.stride(1),
+                gateS,
+                BLOCK_SIZE_M=128, BLOCK_SIZE_N=128, BLOCK_SIZE_K=32,
+                BLOCK_SIZE_R=triton.next_power_of_2(R),
+                GROUP_SIZE_M=8,
+            )
+            h = h.view(*X.shape[:-1], N)
+        else:
+            # Compute gate and up projections with LoRA (uses Triton matmul inside)
+            e = matmul_lora(X, gateW, gateW_quant, gateA, gateB, gateS)
+            g = matmul_lora(X, upW, upW_quant, upA, upB, upS)
+            # Apply activation (SwiGLU)
+            h = forward_fn(e, g)
         
         # Down projection with LoRA
         output = matmul_lora(h, downW, downW_quant, downA, downB, downS)
