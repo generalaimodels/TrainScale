@@ -63,6 +63,7 @@ class TrainingState:
     best_metric: float = float('inf')
     total_loss: float = 0.0
     samples_seen: int = 0
+    patience_counter: int = 0
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -225,6 +226,11 @@ class SOTATrainer:
                     llm_int8_threshold=quant_cfg.llm_int8_threshold,
                 )
         
+        # Determine use_cache (incompatible with gradient checkpointing)
+        use_cache = True
+        if self.config.distributed.gradient_checkpointing:
+            use_cache = False
+
         # Load model
         model = AutoModelForCausalLM.from_pretrained(
             model_cfg.name_or_path,
@@ -234,6 +240,7 @@ class SOTATrainer:
             low_cpu_mem_usage=model_cfg.low_cpu_mem_usage,
             attn_implementation=model_cfg.attn_implementation,
             quantization_config=bnb_config,
+            use_cache=use_cache,
         )
         
         return model
@@ -596,11 +603,15 @@ class SOTATrainer:
                         self.scaler.unscale_(self.optimizer)
                     
                     # Gradient clipping
+                    grad_norm = 0.0
                     if max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
                             self.model.parameters(),
                             max_grad_norm,
                         )
+                    elif hasattr(self.optimizer, "get_grad_norm"):
+                         # Some optimizers like Lion track this
+                         grad_norm = self.optimizer.get_grad_norm()
                     
                     if self.scaler is not None:
                         self.scaler.step(self.optimizer)
@@ -639,6 +650,7 @@ class SOTATrainer:
                             f"PPL: {ppl:.2f} | "
                             f"Acc: {acc:.2%} | "
                             f"LR: {lr:.2e} | "
+                            f"Grad: {grad_norm:.2f} | "
                             f"Tok/Sec: {int(num_tokens * grad_accum / (time.time() - step_start_time))} | "
                             f"ETA: {eta_str}"
                         )
@@ -653,6 +665,10 @@ class SOTATrainer:
                     ):
                         eval_metrics = self.evaluate(eval_dataloader, compute_metrics)
                         logger.info(f"Eval: {eval_metrics}")
+                        
+                        if self._check_early_stopping(eval_metrics):
+                            logger.info("Early stopping triggered.")
+                            return metrics
                     
                     # Saving
                     if (
@@ -672,6 +688,10 @@ class SOTATrainer:
             if eval_dataloader is not None and train_cfg.eval_strategy == "epoch":
                 eval_metrics = self.evaluate(eval_dataloader, compute_metrics)
                 metrics.update({f"eval_{k}": v for k, v in eval_metrics.items()})
+                
+                if self._check_early_stopping(eval_metrics):
+                     logger.info("Early stopping triggered.")
+                     break
             
             # Epoch-wise saving
             if train_cfg.save_strategy == "epoch":
@@ -734,6 +754,26 @@ class SOTATrainer:
             metrics.update(compute_metrics(self.model, eval_dataloader))
         
         return metrics
+
+    def _check_early_stopping(self, metrics: Dict[str, float]) -> bool:
+        """Check if training should stop early."""
+        current_loss = metrics.get("loss", float('inf'))
+        patience = self.config.training.early_stopping_patience
+        threshold = self.config.training.early_stopping_threshold
+        
+        # Check improvement (minimizing loss)
+        if current_loss < (self.state.best_metric - threshold):
+            self.state.best_metric = current_loss
+            self.state.patience_counter = 0
+            return False
+            
+        self.state.patience_counter += 1
+        logger.info(f"⏳ Early Stop Counter: {self.state.patience_counter}/{patience} (Best: {self.state.best_metric:.4f})")
+        
+        if self.state.patience_counter >= patience:
+            return True
+            
+        return False
     
     # ═════════════════════════════════════════════════════════════════════════════
     # Checkpointing

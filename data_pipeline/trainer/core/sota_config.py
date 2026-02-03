@@ -369,6 +369,8 @@ class TrainConfig:
     logging_steps: int = 10
     seed: int = 42
     resume_from_checkpoint: Optional[str] = None
+    early_stopping_patience: int = 3
+    early_stopping_threshold: float = 0.01
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
