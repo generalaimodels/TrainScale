@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import datetime
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -144,6 +145,110 @@ class DDPConfig:
             return BUCKET_SIZE_MB["amd_mi300x"]
         
         return BUCKET_SIZE_MB["default"]
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# DDP Initialization & Factory
+# ════════════════════════════════════════════════════════════════════════════════
+
+class DDPInitializer:
+    """
+    Production-grade DDP initialization with multi-backend support.
+    """
+    
+    @staticmethod
+    def init_process_group(
+        backend: str = "nccl",
+        init_method: str = "env://",
+        world_size: int = None,
+        rank: int = None,
+        timeout_minutes: int = 30,
+    ) -> dist.ProcessGroup:
+        """
+        Initialize distributed process group.
+        
+        Backends:
+        - nccl: GPU-to-GPU (optimal for NVIDIA)
+        - gloo: CPU tensors, fallback
+        - mpi: HPC environments
+        """
+        if world_size is None:
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if rank is None:
+            rank = int(os.environ.get("RANK", "0"))
+        
+        # Configure NCCL environment for optimal performance
+        os.environ.setdefault("NCCL_IB_DISABLE", "0")  # Enable InfiniBand
+        os.environ.setdefault("NCCL_NET_GDR_LEVEL", "5")  # GPUDirect RDMA
+        os.environ.setdefault("NCCL_P2P_LEVEL", "NVL")  # NVLink preference
+        
+        if not dist.is_initialized():
+            dist.init_process_group(
+                backend=backend,
+                init_method=init_method,
+                world_size=world_size,
+                rank=rank,
+                timeout=datetime.timedelta(minutes=timeout_minutes) if isinstance(timeout_minutes, int) else timeout_minutes,
+            )
+        
+        # Set device for current rank
+        if torch.cuda.is_available():
+            local_rank = int(os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count()))
+            torch.cuda.set_device(local_rank)
+        
+        return dist.group.WORLD
+
+    @staticmethod
+    def init_hybrid_backend():
+        """
+        Initialize with NCCL for GPU, Gloo for CPU operations.
+        """
+        if not dist.is_initialized():
+            DDPInitializer.init_process_group(backend="nccl")
+        
+        # Create CPU process group for metadata operations
+        try:
+            cpu_group = dist.new_group(backend="gloo")
+            return cpu_group
+        except Exception as e:
+            logger.warning(f"Failed to initialize hybrid backend (Gloo): {e}")
+            return None
+
+
+class DDPModelFactory:
+    """
+    Factory for creating optimized DDP model wrappers.
+    Legacy/Alternative to SOTADDP wrapper.
+    """
+    
+    @staticmethod
+    def wrap_model(
+        model: torch.nn.Module,
+        device_id: int,
+        bucket_cap_mb: float = 25.0,
+        find_unused_parameters: bool = False,
+        gradient_as_bucket_view: bool = True,
+        static_graph: bool = False,
+        broadcast_buffers: bool = True,
+    ) -> TorchDDP:
+        """
+        Wrap model with optimized DDP configuration.
+        """
+        model = model.to(device_id)
+        
+        ddp_model = TorchDDP(
+            model,
+            device_ids=[device_id],
+            output_device=device_id,
+            bucket_cap_mb=bucket_cap_mb,
+            find_unused_parameters=find_unused_parameters,
+            gradient_as_bucket_view=gradient_as_bucket_view,
+            static_graph=static_graph,
+            broadcast_buffers=broadcast_buffers,
+        )
+        
+        return ddp_model
+
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -705,6 +810,8 @@ def create_ddp_from_config(config: Dict) -> SOTADDP:
 
 __all__ = [
     "SOTADDP",
+    "DDPInitializer",
+    "DDPModelFactory",
     "DDPConfig",
     "GradientCompression",
     "SyncMode",

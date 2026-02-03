@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -660,6 +661,114 @@ class SOTAFSDP2:
 
 
 # ════════════════════════════════════════════════════════════════════════════════
+# Checkpoint Manager
+# ════════════════════════════════════════════════════════════════════════════════
+
+class FSDPCheckpointManager:
+    """
+    Efficient checkpointing strategies for FSDP models.
+    """
+    
+    @staticmethod
+    def save_full_checkpoint(
+        model: nn.Module,
+        optimizer: Optimizer,
+        path: str,
+        rank: int,
+    ):
+        """
+        Gather full state dict on rank 0 (memory intensive but portable).
+        """
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+        
+        full_state_config = FullStateDictConfig(
+            offload_to_cpu=True,      # Offload to CPU during gathering
+            rank0_only=True,          # Only rank 0 saves
+        )
+        
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, full_state_config):
+            state_dict = model.state_dict()
+            optim_state = FSDP.optim_state_dict(model, optimizer)
+            
+            if rank == 0:
+                torch.save({
+                    "model": state_dict,
+                    "optimizer": optim_state,
+                }, path)
+                logger.info(f"Saved full checkpoint to {path}")
+    
+    @staticmethod
+    def save_sharded_checkpoint(
+        model: nn.Module,
+        optimizer: Optimizer,
+        checkpoint_dir: str,
+    ):
+        """
+        Distributed sharded checkpoint (scalable, requires all ranks for loading).
+        """
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import StateDictType, ShardedStateDictConfig
+        from torch.distributed.checkpoint import save
+        from torch.distributed.checkpoint import FileSystemWriter
+        
+        sharded_config = ShardedStateDictConfig(
+            offload_to_cpu=True,
+        )
+        
+        with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_config):
+            state_dict = {"model": model.state_dict()}
+            
+            # Save model
+            save(
+                state_dict=state_dict,
+                storage_writer=FileSystemWriter(checkpoint_dir),
+            )
+            
+            # Save optimizer
+            optim_state = FSDP.optim_state_dict(model, optimizer)
+            save(
+                state_dict={"optimizer": optim_state},
+                storage_writer=FileSystemWriter(os.path.join(checkpoint_dir, "optimizer")),
+            )
+            logger.info(f"Saved sharded checkpoint to {checkpoint_dir}")
+    
+    @staticmethod
+    def load_sharded_checkpoint(
+        model: nn.Module,
+        optimizer: Optimizer,
+        checkpoint_dir: str,
+    ):
+        """
+        Load distributed checkpoint across all ranks.
+        """
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import StateDictType, ShardedStateDictConfig
+        from torch.distributed.checkpoint import load
+        from torch.distributed.checkpoint import FileSystemReader
+        
+        sharded_config = ShardedStateDictConfig(offload_to_cpu=True)
+        
+        with FSDP.state_dict_type(model, StateDictType.SHARDED_STATE_DICT, sharded_config):
+            # Load model
+            state_dict = {"model": model.state_dict()}
+            load(
+                state_dict=state_dict,
+                storage_reader=FileSystemReader(checkpoint_dir),
+            )
+            model.load_state_dict(state_dict["model"])
+            
+            # Load optimizer
+            optim_state = {"optimizer": FSDP.optim_state_dict(model, optimizer)}
+            load(
+                state_dict=optim_state,
+                storage_reader=FileSystemReader(os.path.join(checkpoint_dir, "optimizer")),
+            )
+            FSDP.optim_state_dict_to_load(model, optimizer, optim_state["optimizer"])
+            logger.info(f"Loaded sharded checkpoint from {checkpoint_dir}")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
 # Factory Functions
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -734,6 +843,7 @@ def create_fsdp2_from_config(config: Dict) -> SOTAFSDP2:
 
 __all__ = [
     "SOTAFSDP2",
+    "FSDPCheckpointManager",
     "FSDP2Config",
     "ShardingStrategy",
     "MixedPrecisionPolicy",
