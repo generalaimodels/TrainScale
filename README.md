@@ -73,26 +73,13 @@ graph LR
 git clone https://github.com/generalaimodels/TrainScale.git
 cd TrainScale
 
-# Install dependencies
-pip install -r requirements.txt
+
 
 # Optional: Flash Attention 2 (Recommended for Ampere+)
 pip install flash-attn --no-build-isolation
 ```
 
-### 2. Run E2E Pipeline Demo
 
-```bash
-# Quick sanity check (100 samples, fast tokenizer)
-python data_pipeline/examples/e2e_complete_demo.py \
-    --config data_pipeline/examples/test_pipeline.yaml
-
-# Full production training run
-python data_pipeline/examples/e2e_complete_demo.py \
-    --config data_pipeline/examples/complete_pipeline.yaml \
-    --train \
-    --output-dir ./outputs
-```
 
 ---
 
