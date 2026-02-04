@@ -182,7 +182,7 @@ output_schema:
 # DataLoader Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 dataloader:
-  batch_size: 16
+  batch_size: 8
   num_workers: 8
   pin_memory: true
   drop_last: false
@@ -315,12 +315,20 @@ export:
 # ═════════════════════════════════════════════════════════════════════════════════
 distributed:
   enabled: true
-  backend: "nccl"           # ROCm uses NCCL-compatible RCCL
+  backend: "nccl"
   strategy: "ddp"           # Options: "ddp", "fsdp2", "sota_fsdp"
-  world_size: 4             # Use 4 GPUs
+  world_size: 4
   gradient_checkpointing: true
   gradient_checkpointing_use_reentrant: false
-  fsdp_config: {}
+  fsdp_config:
+    sharding_strategy: "full_shard"  # Kept in config but unused by DDP
+    offload_strategy: "params"
+    mixed_precision: "bf16"
+    use_triton_kernels: false            # Disable custom Triton kernels (Potential crash source)
+    forward_prefetch: false              # Disable prefetch to avoid races
+    backward_prefetch: false
+    activation_checkpointing: true       # Re-enable AC for DDP (Works fine)
+    limit_all_gathers: true
   deepspeed_config: null
   ddp_config:
     find_unused_parameters: false

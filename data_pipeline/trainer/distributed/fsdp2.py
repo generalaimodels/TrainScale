@@ -832,6 +832,11 @@ def create_fsdp2_from_config(config: Dict) -> SOTAFSDP2:
         activation_checkpointing=dist_cfg.get("gradient_checkpointing", True),
         use_orig_params=fsdp_cfg.get("use_orig_params", True),
         forward_prefetch=fsdp_cfg.get("forward_prefetch", True),
+        backward_prefetch=fsdp_cfg.get("backward_prefetch", True),
+        limit_all_gathers=fsdp_cfg.get("limit_all_gathers", True),
+        use_triton_kernels=fsdp_cfg.get("use_triton_kernels", True),
+        sync_module_states=fsdp_cfg.get("sync_module_states", True),
+        offload_strategy=fsdp_cfg.get("offload_strategy", "NONE"), # Enum string
         ac_mode=fsdp_cfg.get("ac_mode", "selective"),
         ac_frequency=fsdp_cfg.get("ac_frequency", 2),
     )
