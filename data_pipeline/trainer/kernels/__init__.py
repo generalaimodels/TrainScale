@@ -105,12 +105,12 @@ from .fp8_kernels import (
     row_quantize_fp8,
     block_quantize_fp8,
     block_dequantize_fp8,
-    fp8_gemm_scaled,
+    fp8_matmul_block_scaled,
+    fp8_matmul_row_scaled,
     FP8Linear,
     FP8Format,
     FP8Config,
     FP8ScaleManager,
-    get_autotune_config,
 )
 
 # 8. Distributed Primitives
@@ -198,12 +198,12 @@ __all__ = [
     "row_quantize_fp8",
     "block_quantize_fp8",
     "block_dequantize_fp8",
-    "fp8_gemm_scaled",
+    "fp8_matmul_block_scaled",
+    "fp8_matmul_row_scaled",
     "FP8Linear",
     "FP8Format",
     "FP8Config",
     "FP8ScaleManager",
-    "get_autotune_config",
     
     # Distributed
     "DistributedKernels",
