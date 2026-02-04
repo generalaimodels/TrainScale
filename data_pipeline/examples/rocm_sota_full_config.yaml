@@ -148,7 +148,7 @@ output_schema:
 # DataLoader Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 dataloader:
-  batch_size: 4
+  batch_size: 16
   num_workers: 4
   pin_memory: true
   drop_last: false

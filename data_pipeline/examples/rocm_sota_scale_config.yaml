@@ -70,24 +70,28 @@ output_schema:
   labels: {dtype: "long", pad_value: -100}
 
 dataloader:
-  batch_size: 8  # Increased per-GPU batch for throughput stress
-  num_workers: 4
+  batch_size: 16 # Stable batch size
+  num_workers: 8
   pin_memory: true
   persistent_workers: true
+  prefetch_factor: 4
 
 # 2. SOTA Optimizer (AdamW with heavy state)
 optimizer:
   type: "adamw"
-  learning_rate: 2.0e-5
+  learning_rate: 2.0e-6  # Reduced 10x for Full FT stability
   weight_decay: 0.01
   betas: [0.9, 0.95]
   eps: 1.0e-8
+  max_grad_norm: 1.0     # Explicit gradient clipping
 
 # 3. LR Schedule Dynamics
 scheduler:
-  type: "cosine"
-  warmup_steps: 10   # Quick warmup
-  warmup_ratio: 0.0  # Use steps
+  type: "wsd"            # Use WSD to get proper warmup
+  warmup_steps: 50
+  warmup_ratio: 0.0
+  stable_ratio: 0.0      # 0 stable steps = immediate decay (Cosine with Warmup)
+  decay_type: "cosine"
   min_lr_ratio: 0.1
 
 loss:
@@ -109,14 +113,14 @@ distributed:
   strategy: "ddp"
   world_size: 4
   ddp_config:
-    find_unused_parameters: true
-    bucket_cap_mb: 50           # Larger buckets for throughput
-    gradient_compression: "fp16" # Enable compression testing
+    find_unused_parameters: false
+    bucket_cap_mb: 50           # Revert to stable 50MB
+    gradient_compression: "fp16"
 
 hardware:
   device: "cuda"
   precision: "bf16"
-  compile_model: false # Avoid compilation overhead for now
+  compile_model: false
 
 kernels:
   use_triton: true
@@ -136,11 +140,11 @@ data:
 training:
   output_dir: "./outputs/scale_test_run"
   num_train_epochs: 1
-  per_device_train_batch_size: 8
-  per_device_eval_batch_size: 8
-  gradient_accumulation_steps: 1 # Frequent updates for optimizer stress
+  per_device_train_batch_size: 16      # Revert to Stable 16
+  per_device_eval_batch_size: 16
+  gradient_accumulation_steps: 4       # Stable Global Batch 256
   eval_strategy: "steps"
   eval_steps: 20
   max_steps: 20
   logging_steps: 1
-  save_steps: 100 # Long enough to see stability
+  save_steps: 100
