@@ -326,9 +326,15 @@ def fast_rms_layernorm(X: Tensor, weight: Tensor, eps: float = 1e-6) -> Tensor:
     return Fast_RMS_LayerNorm.apply(X, weight, eps)
 
 
+
 def fast_layernorm(X: Tensor, weight: Tensor, bias: Tensor, eps: float = 1e-5) -> Tensor:
     """Apply fast LayerNorm with Triton acceleration."""
     return Fast_LayerNorm.apply(X, weight, bias, eps)
+
+
+# Alias to match user request
+fused_layer_norm = fast_layernorm
+
 
 
 def fused_add_rms_layernorm(
@@ -381,6 +387,8 @@ __all__ = [
     # Wrappers
     "fast_rms_layernorm",
     "fast_layernorm",
+    "fast_layernorm",
+    "fused_layer_norm",
     "fused_add_rms_layernorm",
     # Utils
     "calculate_settings",

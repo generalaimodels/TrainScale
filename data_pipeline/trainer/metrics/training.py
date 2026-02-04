@@ -294,7 +294,7 @@ class TrainingMetrics:
         parts = [
             f"step={m['global_step']}",
             f"loss={m['loss']:.4f}",
-            f"ppl={m['ppl']:.2f}",
+            f"ppl={m['ppl']:.2e}" if m['ppl'] > 1000 else f"ppl={m['ppl']:.2f}",
             f"acc={m['accuracy']:.2%}",
             f"tok/s={m['tokens_per_sec']:,.0f}",
             f"grad={m['grad_norm']:.3f}",

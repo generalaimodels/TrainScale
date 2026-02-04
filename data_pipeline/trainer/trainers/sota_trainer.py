@@ -42,6 +42,15 @@ import torch.distributed as dist
 # Internal Imports
 # ═════════════════════════════════════════════════════════════════════════════════
 
+from data_pipeline.trainer.distributed import (
+    DDPInitializer,
+    create_ddp_from_config,
+    create_fsdp2_from_config,
+    SOTADDP,
+    SOTAFSDP2,
+    FSDPCheckpointManager,
+)
+
 from data_pipeline.trainer.core.sota_config import (
     SOTAConfig,
     TrainingMode,
@@ -110,6 +119,12 @@ class SOTATrainer:
         self.scheduler: Optional[Any] = None
         self.loss_fn: Optional[nn.Module] = None
         self.scaler: Optional[torch.cuda.amp.GradScaler] = None
+        
+        # Distributed Initialization
+        self.distributed_strategy = config.distributed.strategy if hasattr(config.distributed, "strategy") else None
+        if self.distributed_strategy in ("ddp", "fsdp", "fsdp2", "sota_fsdp"):
+             DDPInitializer.init_process_group()
+             logger.info(f"Initialized distributed process group for strategy: {self.distributed_strategy}")
         
         # Device setup
         self.device = self._setup_device()
@@ -193,11 +208,28 @@ class SOTATrainer:
         # Apply kernel optimizations
         self.model = self._apply_kernel_optimizations(self.model)
         
-        # Move to device
+        # Move to device (Essential before DDP/FSDP wrapping)
         self.model = self.model.to(self.device)
         
-        # Compile if enabled
+        # SOTA Distributed Wrapping
+        if self.distributed_strategy == "ddp":
+            logger.info("Applying SOTA DDP wrapper...")
+            self.model = create_ddp_from_config(self.config.to_dict()).wrap_model(self.model)
+        
+        elif self.distributed_strategy in ("fsdp", "fsdp2", "sota_fsdp"):
+            logger.info(f"Applying SOTA FSDP2 wrapper ({self.distributed_strategy})...")
+            # FSDP requires model on CPU generally, but SOTA wrapper handles conversion
+            # Using to_dict() assuming config object has this method or accessible dict
+            fsdp_wrapper = create_fsdp2_from_config(self.config.to_dict())
+            self.model = fsdp_wrapper.wrap_model(self.model)
+            
+            # Ensure optimizer knows about FSDP params if needed
+            # (prepare_optimizer will be called later if needed by user, 
+            # but standard construction might need awareness)
+        
+        # Compile if enabled (and compatible)
         if self.config.hardware.compile_model:
+            # Note: FSDP + torch.compile requires use_orig_params=True
             self.model = torch.compile(
                 self.model,
                 mode=self.config.hardware.compile_mode,
@@ -318,8 +350,8 @@ class SOTATrainer:
             from data_pipeline.trainer.registry import patch_model
             model = patch_model(model)
             logger.info("Applied SOTA kernel optimizations via registry")
-        except ImportError:
-            logger.warning("Triton kernels not available, using default implementations")
+        except ImportError as e:
+            logger.warning(f"Triton kernels not available, using default implementations. Error: {e}")
         
         return model
     
@@ -330,6 +362,9 @@ class SOTATrainer:
     def setup_optimizer(self) -> torch.optim.Optimizer:
         """Setup optimizer based on config."""
         opt_cfg = self.config.optimizer
+        
+        # Handle FSDP logic where params might be flattened or sharded
+        # SOTA wrappers handle this, but we need to ensure we pass the right params
         params = [p for p in self.model.parameters() if p.requires_grad]
         
         opt_type = opt_cfg.type
@@ -684,11 +719,13 @@ class SOTATrainer:
                             eta_seconds = int(avg_time_per_step * remaining_steps)
                             eta_str = str(datetime.timedelta(seconds=eta_seconds))
                             
+                            ppl_str = f"PPL: {ppl:.2e}" if ppl > 1000 else f"PPL: {ppl:.2f}"
+                            
                             logger.info(
                                 f"Epoch {epoch+1}/{train_cfg.num_train_epochs} | "
                                 f"Step {steps_done}/{num_training_steps} | "
                                 f"Loss: {metrics_to_reduce['loss']:.4f} | " # Global
-                                f"PPL: {ppl:.2f} | "                         # Global
+                                f"{ppl_str} | "                              # Global
                                 f"Acc: {metrics_to_reduce['acc']:.2%} | "   # Global
                                 f"LR: {lr:.2e} | "
                                 f"Grad: {metrics_to_reduce['grad']:.2f} | " # Global
@@ -875,36 +912,99 @@ class SOTATrainer:
         
         os.makedirs(path, exist_ok=True)
         
-        # Save model
-        if hasattr(self.model, 'save_pretrained'):
-            self.model.save_pretrained(path)
-        else:
-            torch.save(self.model.state_dict(), os.path.join(path, "model.pt"))
-        
-        # Save optimizer and scheduler
-        torch.save({
-            "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict() if self.scheduler else None,
-            "state": self.state,
-            "config": self.config.to_dict(),
-            "rng_state": {
-                "python": random.getstate(),
-                "numpy": np.random.get_state(),
-                "torch": torch.get_rng_state(),
-                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+        # SOTA FSDP Handling
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        if isinstance(self.model, FSDP):
+            logger.info(f"Saving FSDP sharded checkpoint to {path}")
+            FSDPCheckpointManager.save_sharded_checkpoint(
+                self.model,
+                self.optimizer,
+                path
+            )
+            # Save state metadata and RNG
+            state_dict = {
+                "state": self.state,
+                "config": self.config.to_dict(),
+                "rng_state": {
+                    "python": random.getstate(),
+                    "numpy": np.random.get_state(),
+                    "torch": torch.get_rng_state(),
+                    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                }
             }
-        }, os.path.join(path, "trainer_state.pt"))
+            if self.scheduler:
+                state_dict["scheduler"] = self.scheduler.state_dict()
+                
+            torch.save(state_dict, os.path.join(path, "trainer_state.pt"))
+            return
+
+        # Standard Handling (DDP/Single GPU)
+        # Unwrap DDP if present
+        model_to_save = self.model.module if hasattr(self.model, "module") else self.model
         
-        logger.info(f"Checkpoint saved: {path}")
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            logger.info(f"Saving checkpoint to {path}")
+            
+            # Save model
+            if hasattr(model_to_save, 'save_pretrained'):
+                model_to_save.save_pretrained(path)
+            else:
+                torch.save(model_to_save.state_dict(), os.path.join(path, "model.pt"))
+            
+            # Save optimizer and scheduler
+            torch.save({
+                "optimizer": self.optimizer.state_dict(),
+                "scheduler": self.scheduler.state_dict() if self.scheduler else None,
+                "state": self.state,
+                "config": self.config.to_dict(),
+                "rng_state": {
+                    "python": random.getstate(),
+                    "numpy": np.random.get_state(),
+                    "torch": torch.get_rng_state(),
+                    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                }
+            }, os.path.join(path, "trainer_state.pt"))
+            
+            logger.info(f"Checkpoint saved: {path}")
     
     def load_checkpoint(self, path: str):
         """Load training checkpoint."""
+        logger.info(f"Loading checkpoint from {path}")
+        
+        # SOTA FSDP Handling
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        if isinstance(self.model, FSDP):
+            FSDPCheckpointManager.load_sharded_checkpoint(
+                self.model,
+                self.optimizer,
+                path
+            )
+            # Load state metadata
+            state_path = os.path.join(path, "trainer_state.pt")
+            if os.path.exists(state_path):
+                checkpoint = torch.load(state_path, map_location="cpu") # Meta on CPU
+                self.state = checkpoint["state"]
+                if self.scheduler and checkpoint.get("scheduler"):
+                    self.scheduler.load_state_dict(checkpoint["scheduler"])
+                 # Restore RNG
+                if "rng_state" in checkpoint:
+                     rng = checkpoint["rng_state"]
+                     try:
+                        random.setstate(rng["python"])
+                        np.random.set_state(rng["numpy"])
+                        torch.set_rng_state(rng["torch"].cpu())
+                        if rng["cuda"] is not None and torch.cuda.is_available():
+                            torch.cuda.set_rng_state_all([t.cpu() for t in rng["cuda"]] if isinstance(rng["cuda"], list) else rng["cuda"].cpu())
+                     except Exception as e:
+                        logger.warning(f"Failed to restore RNG state: {e}")
+            return
+
         # Load trainer state
         state_path = os.path.join(path, "trainer_state.pt")
         if os.path.exists(state_path):
             checkpoint = torch.load(state_path, map_location=self.device, weights_only=False)
             self.optimizer.load_state_dict(checkpoint["optimizer"])
-            if self.scheduler and checkpoint["scheduler"]:
+            if self.scheduler and checkpoint.get("scheduler"):
                 self.scheduler.load_state_dict(checkpoint["scheduler"])
             self.state = checkpoint["state"]
             

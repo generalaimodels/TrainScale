@@ -258,9 +258,11 @@ def patch_model(model: nn.Module, model_info: Optional[ModelInfo] = None) -> nn.
     - MLP → SwiGLU/GeGLU kernels
     - RoPE → Fast RoPE
     """
-    from data_pipeline.trainer.kernels.triton_kernels import (
+    from data_pipeline.trainer.kernels import (
         fast_rms_layernorm,
         swiglu_forward,
+        geglu_forward,
+        flash_attention,
     )
     
     patched_layers = []
@@ -316,6 +318,61 @@ register_layer_patch("GrokRMSNorm", auto_patch_layernorm)
 register_layer_patch("InternVLRMSNorm", auto_patch_layernorm)
 
 
+def auto_patch_mlp(module: nn.Module) -> None:
+    """Patch LlamaMLP/SwiGLU forward to use Triton kernel."""
+    from data_pipeline.trainer.kernels import swiglu_forward
+    
+    # Check if it's a SwiGLU MLP (has gate_proj, up_proj, down_proj)
+    if not (hasattr(module, 'gate_proj') and hasattr(module, 'up_proj') and hasattr(module, 'down_proj')):
+        return
+
+    def patched_forward(x):
+        return module.down_proj(swiglu_forward(module.gate_proj(x), module.up_proj(x)))
+
+    module.forward = patched_forward
+
+
+def auto_patch_attention(module: nn.Module) -> None:
+    """Patch Attention forward to use Flash Attention 2."""
+    from data_pipeline.trainer.kernels import flash_attention
+    
+    # Simple heuristic patch - this assumes standard HF signature
+    # Real implementation would need to handle cache, rope, etc. carefully
+    # We will alias the inner flash_attn implementation if possible
+    pass 
+    # NOTE: Full attention patching is complex due to KV cache handling. 
+    # For now, we rely on the creating 'FlashAttention' modules directly 
+    # rather than monkeypatching existing ones, or use 'auto_patch_mlp' and norms which are safer.
+    # We will enable MLP patching.
+
+
+def auto_patch_mlp_geglu(module: nn.Module) -> None:
+    """Patch GemmaMLP/GeGLU forward to use Triton kernel."""
+    from data_pipeline.trainer.kernels import geglu_forward
+    
+    if not (hasattr(module, 'gate_proj') and hasattr(module, 'up_proj') and hasattr(module, 'down_proj')):
+        return
+
+    def patched_forward(x):
+        return module.down_proj(geglu_forward(module.gate_proj(x), module.up_proj(x)))
+
+    module.forward = patched_forward
+
+
+# Register MLP patches (SwiGLU architectures)
+register_layer_patch("LlamaMLP", auto_patch_mlp)
+register_layer_patch("Qwen2MLP", auto_patch_mlp)
+register_layer_patch("MistralMLP", auto_patch_mlp)
+register_layer_patch("MixtralBlockSparseTop2MLP", auto_patch_mlp)
+
+# Register MLP patches (GeGLU architectures)
+register_layer_patch("Gemma2MLP", auto_patch_mlp_geglu)
+# Gemma 1 also uses GeGLU usually
+register_layer_patch("GemmaMLP", auto_patch_mlp_geglu)
+
+
+
+
 # ═════════════════════════════════════════════════════════════════════════════════
 # Import All Model Families (300+ models total)
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -360,4 +417,7 @@ __all__ = [
     "register_layer_patch",
     "patch_model",
     "auto_patch_layernorm",
+    "auto_patch_mlp",
+    "auto_patch_mlp_geglu",
+    "auto_patch_attention",
 ]

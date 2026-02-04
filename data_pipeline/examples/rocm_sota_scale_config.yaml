@@ -1,0 +1,146 @@
+# ════════════════════════════════════════════════════════════════════════════════
+# SOTA Scale & Stress Test Configuration
+# ════════════════════════════════════════════════════════════════════════════════
+# Objective:
+#   1. Multi-rank Verification (4 GPUs)
+#   2. Optimizer Stress (Full Fine-tune of 7B model)
+#   3. LR Schedule Dynamics (Warmup + Decay)
+#   4. Long-Horizon Stability (100 steps)
+# ════════════════════════════════════════════════════════════════════════════════
+
+config_version: "2.0"
+config_type: "sota_training"
+type: "data_module"
+version: "1.0"
+
+# 1. Stress Test Mode: Full Fine-Tuning
+training_mode: "full"
+
+model:
+  name_or_path: "mistralai/Mistral-7B-Instruct-v0.3"
+  trust_remote_code: true
+  torch_dtype: "bfloat16"
+  low_cpu_mem_usage: true
+  use_flash_attention_2: false
+  attn_implementation: "sdpa"
+
+tokenizer:
+  name_or_path: "mistralai/Mistral-7B-Instruct-v0.3"
+  use_fast: true
+  padding_side: "right"
+  max_length: 4096
+  add_eos_token: true
+  add_pad_token: true
+
+dataset:
+  name: "HuggingFaceH4/ultrachat_200k"
+  splits:
+    train:
+      name: "train_sft"
+      sample_size: 10000
+      shuffle: true
+    validation:
+      name: "test_sft"
+      sample_size: 1000
+      shuffle: false
+  column_mapping:
+    messages: "messages"
+
+introspection:
+  enabled: true
+  auto_discover_splits: true
+  trust_remote_code: true
+  fallback_columns: ["messages"]
+
+prompt_template:
+  format_type: "chat"
+  mask_input: true
+
+preprocessing:
+  length_manager:
+    enabled: true
+    max_total_length: 4096
+  packing:
+    enabled: true
+    efficiency_threshold: 0.95
+
+output_schema:
+  input_ids: {dtype: "long"}
+  attention_mask: {dtype: "long", pad_value: 0}
+  labels: {dtype: "long", pad_value: -100}
+
+dataloader:
+  batch_size: 8  # Increased per-GPU batch for throughput stress
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+
+# 2. SOTA Optimizer (AdamW with heavy state)
+optimizer:
+  type: "adamw"
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.95]
+  eps: 1.0e-8
+
+# 3. LR Schedule Dynamics
+scheduler:
+  type: "cosine"
+  warmup_steps: 10   # Quick warmup
+  warmup_ratio: 0.0  # Use steps
+  min_lr_ratio: 0.1
+
+loss:
+  type: "chunked_ce"
+  chunk_size: 32768
+
+quantization:
+  enabled: false
+
+export:
+  enabled: true
+  output_dir: "./outputs/scale_test_export"
+  merge_lora: false # Full FT doesn't need merge
+
+# 4. Multi-GPU Configuration
+distributed:
+  enabled: true
+  backend: "nccl"
+  strategy: "ddp"
+  world_size: 4
+  ddp_config:
+    find_unused_parameters: true
+    bucket_cap_mb: 50           # Larger buckets for throughput
+    gradient_compression: "fp16" # Enable compression testing
+
+hardware:
+  device: "cuda"
+  precision: "bf16"
+  compile_model: false # Avoid compilation overhead for now
+
+kernels:
+  use_triton: true
+  use_flash_attention: true
+  use_fused_rope: true
+  use_fused_rms_norm: true
+  use_fused_cross_entropy: true
+
+data:
+  dataset_name: "HuggingFaceH4/ultrachat_200k"
+  max_samples: 10000
+  train_split: "train_sft"
+  eval_split: "test_sft"
+  text_column: "messages"
+  max_seq_length: 4096
+
+training:
+  output_dir: "./outputs/scale_test_run"
+  num_train_epochs: 1
+  per_device_train_batch_size: 8
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 1 # Frequent updates for optimizer stress
+  eval_strategy: "steps"
+  eval_steps: 20
+  max_steps: 20
+  logging_steps: 1
+  save_steps: 100 # Long enough to see stability

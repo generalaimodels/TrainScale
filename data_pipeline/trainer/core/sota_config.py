@@ -302,6 +302,7 @@ class DistributedConfig:
     gradient_checkpointing: bool = True
     gradient_checkpointing_use_reentrant: bool = False
     fsdp_config: Dict[str, Any] = field(default_factory=dict)
+    ddp_config: Dict[str, Any] = field(default_factory=dict)
     deepspeed_config: Optional[str] = None
 
 

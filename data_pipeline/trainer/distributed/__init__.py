@@ -867,15 +867,20 @@ __all__ = [
     "create_parallel_dims_from_config",
     # FSDP2 (Above SOTA FSDP with Triton)
     "SOTAFSDP2",
+    "FSDPCheckpointManager",
     "FSDP2Config",
     "ShardingStrategy",
     "MixedPrecisionPolicy",
+    "OffloadStrategy",
     "create_fsdp2",
     "create_fsdp2_from_config",
     # DDP (Optimized DDP with gradient compression)
     "SOTADDP",
+    "DDPInitializer",
+    "DDPModelFactory",
     "DDPConfig",
     "GradientCompression",
+    "SyncMode",
     "create_ddp",
     "create_ddp_from_config",
     # Context Parallel (Ultra-long sequence support)
@@ -915,17 +920,22 @@ from .parallel_dims import (
 
 from .fsdp2 import (
     SOTAFSDP2,
+    FSDPCheckpointManager,
     FSDP2Config,
     ShardingStrategy,
     MixedPrecisionPolicy,
+    OffloadStrategy,
     create_fsdp2,
     create_fsdp2_from_config,
 )
 
 from .ddp import (
     SOTADDP,
+    DDPInitializer,
+    DDPModelFactory,
     DDPConfig,
     GradientCompression,
+    SyncMode,
     create_ddp,
     create_ddp_from_config,
 )

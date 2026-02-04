@@ -84,7 +84,7 @@ dataset:
     train:
       name: "train_sft"
       alias: "training"
-      sample_size: 1000 # Start with 100 for rapid demo testing
+      sample_size: 10000 # Start with 100 for rapid demo testing
       shuffle: true
       seed: 42
     validation:
@@ -182,7 +182,7 @@ output_schema:
 # DataLoader Configuration
 # ═════════════════════════════════════════════════════════════════════════════════
 dataloader:
-  batch_size: 4
+  batch_size: 16
   num_workers: 4
   pin_memory: true
   drop_last: false
@@ -316,12 +316,33 @@ export:
 distributed:
   enabled: true
   backend: "nccl"           # ROCm uses NCCL-compatible RCCL
-  strategy: "ddp"           # ddp, fsdp, deepspeed
+  strategy: "ddp"           # Options: "ddp", "fsdp2", "sota_fsdp"
   world_size: 4             # Use 4 GPUs
-  gradient_checkpointing: true
-  gradient_checkpointing_use_reentrant: false
-  fsdp_config: {}
-  deepspeed_config: null
+  
+  # FSDP2 Specific Configuration (SOTA)
+  fsdp_config:
+    sharding_strategy: "HYBRID_SHARD"  # FULL_SHARD, SHARD_GRAD_OP, HYBRID_SHARD, NO_SHARD
+    mixed_precision: "Modulated_BF16"  # FULL_BF16, HALF_BF16, FULL_FP16, HYBRID_FP8
+    offload_strategy: "NONE"           # NONE, CPU_OFFLOAD, NVME_OFFLOAD
+    auto_wrap_policy:                  # Layers to wrap individually
+      - "MistralDecoderLayer"
+      - "LlamaDecoderLayer"
+    activation_checkpointing: true
+    activation_checkpointing_mode: "selective" # full, selective
+    use_orig_params: true              # Required for torch.compile
+    sync_module_states: true
+    forward_prefetch: true
+    limit_all_gathers: true
+
+  # DDP Specific Configuration (SOTA)
+  ddp_config:
+    find_unused_parameters: true
+    gradient_as_bucket_view: true
+    static_graph: false
+    bucket_cap_mb: 25                  # Optimized default
+    gradient_compression: "fp16"       # none, fp16, bf16, powersgd, int8
+    compress_hook_mode: "allreduce"    # allreduce, allgather
+
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # Hardware Configuration - AMD MI300X (ROCm)

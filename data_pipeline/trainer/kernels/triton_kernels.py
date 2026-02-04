@@ -606,6 +606,124 @@ def fast_rms_layernorm(X: Tensor, weight: Tensor, eps: float = 1e-6) -> Tensor:
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
+# GELU Activation Kernels
+# ═════════════════════════════════════════════════════════════════════════════════
+
+if _TRITON_AVAILABLE:
+    
+    @triton.jit
+    def _gelu_kernel(
+        x_ptr,
+        y_ptr,
+        n_elements,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """
+        Fast GELU kernel (exact).
+        0.5 * x * (1 + erf(x / sqrt(2)))
+        """
+        pid = tl.program_id(0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        
+        x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+        
+        # Exact GELU
+        y = 0.5 * x * (1.0 + tl.math.erf(tl.math.rsqrt(2.0) * x))
+        
+        tl.store(y_ptr + offsets, y.to(y_ptr.dtype.element_ty), mask=mask)
+
+
+def fused_gelu(x: Tensor) -> Tensor:
+    """
+    Apply fused GELU activation with Triton.
+    """
+    if not _TRITON_AVAILABLE or not x.is_cuda:
+        return torch.nn.functional.gelu(x)
+    
+    n_elements = x.numel()
+    y = torch.empty_like(x)
+    
+    grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+    
+    _gelu_kernel[grid](
+        x, y, n_elements,
+        BLOCK_SIZE=1024,
+    )
+    return y
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Softmax Kernels
+# ═════════════════════════════════════════════════════════════════════════════════
+
+if _TRITON_AVAILABLE:
+
+    @triton.jit
+    def _softmax_kernel(
+        output_ptr,
+        input_ptr,
+        input_row_stride,
+        output_row_stride,
+        n_cols,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """
+        Fused Softmax kernel.
+        """
+        row_idx = tl.program_id(0)
+        
+        row_start_ptr = input_ptr + row_idx * input_row_stride
+        col_offsets = tl.arange(0, BLOCK_SIZE)
+        input_ptrs = row_start_ptr + col_offsets
+        
+        mask = col_offsets < n_cols
+        row = tl.load(input_ptrs, mask=mask, other=-float('inf')).to(tl.float32)
+        
+        # Numerical stability
+        row_minus_max = row - tl.max(row, axis=0)
+        numerator = tl.exp(row_minus_max)
+        denominator = tl.sum(numerator, axis=0)
+        softmax_output = numerator / denominator
+        
+        output_row_start_ptr = output_ptr + row_idx * output_row_stride
+        output_ptrs = output_row_start_ptr + col_offsets
+        tl.store(output_ptrs, softmax_output, mask=mask)
+
+
+def fused_softmax(x: Tensor, dim: int = -1) -> Tensor:
+    """
+    Apply fused Softmax with Triton.
+    Supported only for last dimension currently.
+    """
+    if not _TRITON_AVAILABLE or not x.is_cuda or dim != -1:
+        return torch.nn.functional.softmax(x, dim=dim)
+    
+    # Flatten everything except last dim
+    n_cols = x.shape[-1]
+    x_flattened = x.view(-1, n_cols)
+    n_rows = x_flattened.shape[0]
+    
+    BLOCK_SIZE = triton.next_power_of_2(n_cols)
+    num_warps = 4
+    if BLOCK_SIZE >= 2048: num_warps = 8
+    if BLOCK_SIZE >= 4096: num_warps = 16
+    
+    y = torch.empty_like(x_flattened)
+    
+    _softmax_kernel[(n_rows,)](
+        y, x_flattened,
+        x_flattened.stride(0),
+        y.stride(0),
+        n_cols,
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=num_warps,
+    )
+    return y.view_as(x)
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
 # SwiGLU Activation Kernels
 # ═════════════════════════════════════════════════════════════════════════════════
 
@@ -923,6 +1041,9 @@ __all__ = [
     "swiglu_backward",
     # GeGLU
     "geglu_forward",
+    # Activation
+    "fused_gelu",
+    "fused_softmax",
     # RoPE
     "apply_rope",
     "precompute_freqs_cis",

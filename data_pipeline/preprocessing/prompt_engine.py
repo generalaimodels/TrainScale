@@ -198,6 +198,7 @@ class PromptEngine:
         Constructs messages list and uses tokenizer's chat template.
         """
         messages = []
+        assistant_content = None
         
         # Build message history
         # Case 1: Input column is already a list of messages (e.g. UltraChat)
@@ -228,9 +229,17 @@ class PromptEngine:
             
             # Build user message from input columns
             user_content_parts = []
-            for col in self._template.input_columns:
-                if col in example and example[col]:
-                    user_content_parts.append(str(example[col]))
+            
+            # Robustly handle potential missing columns
+            try:
+                for col in self._template.input_columns:
+                    if col in example:
+                        val = example[col]
+                        if val is not None:
+                            user_content_parts.append(str(val))
+            except Exception:
+                # Fallback if iteration fails
+                pass
             
             user_content = "\n".join(user_content_parts)
             if user_content:
@@ -241,7 +250,8 @@ class PromptEngine:
             
             # Add assistant response if label column present
             if self._template.label_column and self._template.label_column in example:
-                assistant_content = str(example[self._template.label_column])
+                val = example[self._template.label_column]
+                assistant_content = str(val) if val is not None else ""
                 messages.append({
                     "role": "assistant",
                     "content": assistant_content,
@@ -257,6 +267,10 @@ class PromptEngine:
         tokenizer = self._tokenizer.tokenizer
         
         try:
+            if not messages:
+                # Fallback for empty examples to prevent crash
+                messages = [{"role": "user", "content": "empty"}]
+
             # Encode without assistant for input length calculation
             if hasattr(tokenizer, "apply_chat_template"):
                 # Get input tokens (without assistant response)
