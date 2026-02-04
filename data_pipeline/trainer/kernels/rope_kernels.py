@@ -694,38 +694,36 @@ if _TRITON_AVAILABLE:
         
         for h in range(GROUP_SIZE):
             head_idx = head_start + h
-            if head_idx >= n_heads:
-                break
-            
-            x_base = X_ptr + pid_batch * X_batch_stride + head_idx * X_head_stride
-            
-            if INTERLEAVED:
-                dim_offs_0 = dim_offs * 2
-                dim_offs_1 = dim_offs * 2 + 1
+            if head_idx < n_heads:
+                x_base = X_ptr + pid_batch * X_batch_stride + head_idx * X_head_stride
                 
-                x_ptrs_0 = x_base + seq_offs[:, None] * X_seq_stride + dim_offs_0[None, :] * X_dim_stride
-                x_ptrs_1 = x_base + seq_offs[:, None] * X_seq_stride + dim_offs_1[None, :] * X_dim_stride
-                
-                x0 = tl.load(x_ptrs_0, mask=freq_mask, other=0.0)
-                x1 = tl.load(x_ptrs_1, mask=freq_mask, other=0.0)
-                
-                x0_rot = x0 * cos_vals - x1 * sin_vals
-                x1_rot = x1 * cos_vals + x0 * sin_vals
-                
-                tl.store(x_ptrs_0, x0_rot, mask=freq_mask)
-                tl.store(x_ptrs_1, x1_rot, mask=freq_mask)
-            else:
-                x_ptrs_first = x_base + seq_offs[:, None] * X_seq_stride + dim_offs[None, :] * X_dim_stride
-                x_ptrs_second = x_base + seq_offs[:, None] * X_seq_stride + (dim_offs[None, :] + half_dim) * X_dim_stride
-                
-                x_first = tl.load(x_ptrs_first, mask=freq_mask, other=0.0)
-                x_second = tl.load(x_ptrs_second, mask=freq_mask, other=0.0)
-                
-                x_first_rot = x_first * cos_vals - x_second * sin_vals
-                x_second_rot = x_second * cos_vals + x_first * sin_vals
-                
-                tl.store(x_ptrs_first, x_first_rot, mask=freq_mask)
-                tl.store(x_ptrs_second, x_second_rot, mask=freq_mask)
+                if INTERLEAVED:
+                    dim_offs_0 = dim_offs * 2
+                    dim_offs_1 = dim_offs * 2 + 1
+                    
+                    x_ptrs_0 = x_base + seq_offs[:, None] * X_seq_stride + dim_offs_0[None, :] * X_dim_stride
+                    x_ptrs_1 = x_base + seq_offs[:, None] * X_seq_stride + dim_offs_1[None, :] * X_dim_stride
+                    
+                    x0 = tl.load(x_ptrs_0, mask=freq_mask, other=0.0)
+                    x1 = tl.load(x_ptrs_1, mask=freq_mask, other=0.0)
+                    
+                    x0_rot = x0 * cos_vals - x1 * sin_vals
+                    x1_rot = x1 * cos_vals + x0 * sin_vals
+                    
+                    tl.store(x_ptrs_0, x0_rot, mask=freq_mask)
+                    tl.store(x_ptrs_1, x1_rot, mask=freq_mask)
+                else:
+                    x_ptrs_first = x_base + seq_offs[:, None] * X_seq_stride + dim_offs[None, :] * X_dim_stride
+                    x_ptrs_second = x_base + seq_offs[:, None] * X_seq_stride + (dim_offs[None, :] + half_dim) * X_dim_stride
+                    
+                    x_first = tl.load(x_ptrs_first, mask=freq_mask, other=0.0)
+                    x_second = tl.load(x_ptrs_second, mask=freq_mask, other=0.0)
+                    
+                    x_first_rot = x_first * cos_vals - x_second * sin_vals
+                    x_second_rot = x_second * cos_vals + x_first * sin_vals
+                    
+                    tl.store(x_ptrs_first, x_first_rot, mask=freq_mask)
+                    tl.store(x_ptrs_second, x_second_rot, mask=freq_mask)
 
 
     @triton.jit
@@ -780,32 +778,30 @@ if _TRITON_AVAILABLE:
         
         for h in range(GROUP_SIZE):
             head_idx = head_start + h
-            if head_idx >= n_heads:
-                break
-            
-            x_base = X_ptr + pid_batch * X_batch_stride + pid_seq * X_seq_stride + head_idx * X_head_stride
-            
-            if INTERLEAVED:
-                dim_offs_0 = dim_offs * 2
-                dim_offs_1 = dim_offs * 2 + 1
+            if head_idx < n_heads:
+                x_base = X_ptr + pid_batch * X_batch_stride + pid_seq * X_seq_stride + head_idx * X_head_stride
                 
-                x0 = tl.load(x_base + dim_offs_0 * X_dim_stride, mask=dim_mask, other=0.0)
-                x1 = tl.load(x_base + dim_offs_1 * X_dim_stride, mask=dim_mask, other=0.0)
-                
-                x0_rot = x0 * cos_vals - x1 * sin_vals
-                x1_rot = x1 * cos_vals + x0 * sin_vals
-                
-                tl.store(x_base + dim_offs_0 * X_dim_stride, x0_rot, mask=dim_mask)
-                tl.store(x_base + dim_offs_1 * X_dim_stride, x1_rot, mask=dim_mask)
-            else:
-                x_first = tl.load(x_base + dim_offs * X_dim_stride, mask=dim_mask, other=0.0)
-                x_second = tl.load(x_base + (dim_offs + half_dim) * X_dim_stride, mask=dim_mask, other=0.0)
-                
-                x_first_rot = x_first * cos_vals - x_second * sin_vals
-                x_second_rot = x_second * cos_vals + x_first * sin_vals
-                
-                tl.store(x_base + dim_offs * X_dim_stride, x_first_rot, mask=dim_mask)
-                tl.store(x_base + (dim_offs + half_dim) * X_dim_stride, x_second_rot, mask=dim_mask)
+                if INTERLEAVED:
+                    dim_offs_0 = dim_offs * 2
+                    dim_offs_1 = dim_offs * 2 + 1
+                    
+                    x0 = tl.load(x_base + dim_offs_0 * X_dim_stride, mask=dim_mask, other=0.0)
+                    x1 = tl.load(x_base + dim_offs_1 * X_dim_stride, mask=dim_mask, other=0.0)
+                    
+                    x0_rot = x0 * cos_vals - x1 * sin_vals
+                    x1_rot = x1 * cos_vals + x0 * sin_vals
+                    
+                    tl.store(x_base + dim_offs_0 * X_dim_stride, x0_rot, mask=dim_mask)
+                    tl.store(x_base + dim_offs_1 * X_dim_stride, x1_rot, mask=dim_mask)
+                else:
+                    x_first = tl.load(x_base + dim_offs * X_dim_stride, mask=dim_mask, other=0.0)
+                    x_second = tl.load(x_base + (dim_offs + half_dim) * X_dim_stride, mask=dim_mask, other=0.0)
+                    
+                    x_first_rot = x_first * cos_vals - x_second * sin_vals
+                    x_second_rot = x_second * cos_vals + x_first * sin_vals
+                    
+                    tl.store(x_base + dim_offs * X_dim_stride, x_first_rot, mask=dim_mask)
+                    tl.store(x_base + (dim_offs + half_dim) * X_dim_stride, x_second_rot, mask=dim_mask)
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
