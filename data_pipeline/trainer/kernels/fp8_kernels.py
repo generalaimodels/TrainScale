@@ -546,7 +546,7 @@ if _TRITON_AVAILABLE:
             tl.store(y_row_ptr + offs_n * stride_yn, y_block.to(y_ptr.dtype.element_ty), mask=mask)
         
         # Store row scale
-        tl.store(scale_ptr + pid_m, scale)
+        tl.store(scale_ptr + pid_m + tl.arange(0, 1), scale)
     
     
     @triton.jit
@@ -604,7 +604,7 @@ if _TRITON_AVAILABLE:
             y_vals = tl.maximum(tl.minimum(x_vals.to(tl.float32) * scale_inv, FP8_MAX), -FP8_MAX)
             tl.store(y_row_ptr + offs * stride_yn, y_vals.to(y_ptr.dtype.element_ty), mask=mask)
         
-        tl.store(scale_ptr + pid_m, scale)
+        tl.store(scale_ptr + pid_m + tl.arange(0, 1), scale)
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
