@@ -13,23 +13,38 @@
 from typing import Optional
 
 # 1. Compiler & Infrastructure
-from .compiler import compile_model
-from .triton_kernels import is_triton_available
+from .compiler import (
+    compile_model,
+    CompilationMode,
+    CompilationBackend,
+    PrecisionMode,
+    CompilationConfig,
+    InductorConfig,
+)
+from .triton_kernels import (
+    is_triton_available,
+    Fast_CrossEntropyLoss,
+)
 
 # 2. Normalization & Activations
 from .layernorm_kernels import (
     fused_layer_norm,
     fast_rms_layernorm,
-    Fast_RMS_LayerNorm,
     fused_add_rms_layernorm,
+    LayerNormConfig,
 )
 from .triton_kernels import (
     fused_softmax,
     fused_gelu,
     swiglu_forward,
-    swiglu_backward,
     geglu_forward,
     fast_cross_entropy_loss,
+    Fast_RMS_LayerNorm,
+    Fast_SwiGLU,
+    Fast_GeGLU,
+    TritonRMSNorm,
+    TritonSwiGLU,
+    TritonGeGLU,
 )
 
 # 3. Attention Mechanisms (Flash & Flex)
@@ -38,6 +53,9 @@ from .flash_attention import (
     FlashAttention,
     MultiHeadFlashAttention,
     is_flash_attn_available,
+    FlashAttentionConfig,
+    AttentionMaskType,
+    AttentionOutput,
 )
 from .flex_attention import (
     attention_softcapping_compiled,
@@ -45,6 +63,9 @@ from .flex_attention import (
     scaled_dot_product_attention,
     create_causal_mask,
     create_sliding_window_causal_mask,
+    FlexAttentionConfig,
+    AttentionBackend,
+    BackendCapabilities,
 )
 
 # 4. RoPE Embeddings
@@ -53,6 +74,9 @@ from .rope_kernels import (
     Fast_RoPE_Embedding,
     inplace_rope_embedding,
     precompute_freqs_cis,
+    RoPEConfig,
+    RoPEScalingType,
+    RoPEFrequencyCache,
 )
 
 # 5. LoRA Primitives (Fused)
@@ -63,51 +87,80 @@ from .fast_lora_mlp import (
     apply_lora_mlp_swiglu,
     apply_lora_qkv,
     get_lora_parameters,
+    torch_amp_custom_fwd,
+    torch_amp_custom_bwd,
 )
 
 # 6. Mixture of Experts (MoE)
 from .moe_kernels import (
-    GroupedGEMM,
-    grouped_gemm_forward,
-    grouped_gemm_backward_dX,
-    grouped_gemm_backward_dW,
     supports_tma,
+    MoEKernelConfig,
+    AcceleratorArch,
+    get_accelerator_arch,
+    supports_wgmma,
 )
 
 # 7. FP8 Quantization
 from .fp8_kernels import (
-    activation_quant,
-    weight_dequant,
-    FP8BlockLinear,
+    row_quantize_fp8,
+    block_quantize_fp8,
+    block_dequantize_fp8,
+    fp8_gemm_scaled,
+    FP8Linear,
+    FP8Format,
+    FP8Config,
+    FP8ScaleManager,
+    get_autotune_config,
 )
 
 # 8. Distributed Primitives
 from .distributed_kernels import (
     DistributedKernels,
     pinned_memory_transfer,
+    DistributedBackend,
+    DistributedConfig,
+    get_distributed_backend,
+    get_world_info,
 )
 
 __all__ = [
     # Infrastructure
     "compile_model",
+    "CompilationMode",
+    "CompilationBackend",
+    "PrecisionMode",
+    "CompilationConfig",
+    "InductorConfig",
     "is_triton_available",
     "supports_tma",
+    "AcceleratorArch",
+    "get_accelerator_arch",
+    "supports_wgmma",
     
     # Norms & Activations
     "fused_layer_norm",
     "fast_rms_layernorm",
-    "Fast_RMS_LayerNorm",
     "fused_add_rms_layernorm",
+    "LayerNormConfig",
     "fused_softmax",
     "fused_gelu",
     "swiglu_forward",
-    "swiglu_backward",
     "geglu_forward",
     "fast_cross_entropy_loss",
+    "Fast_CrossEntropyLoss",
+    "Fast_RMS_LayerNorm",
+    "Fast_SwiGLU",
+    "Fast_GeGLU",
+    "TritonRMSNorm",
+    "TritonSwiGLU",
+    "TritonGeGLU",
     
     # Attention
     "flash_attention",
     "FlashAttention",
+    "FlashAttentionConfig",
+    "AttentionMaskType",
+    "AttentionOutput",
     "MultiHeadFlashAttention",
     "is_flash_attn_available",
     "attention_softcapping_compiled",
@@ -115,12 +168,18 @@ __all__ = [
     "scaled_dot_product_attention",
     "create_causal_mask",
     "create_sliding_window_causal_mask",
+    "FlexAttentionConfig",
+    "AttentionBackend",
+    "BackendCapabilities",
     
     # RoPE
     "fast_rope_embedding",
     "Fast_RoPE_Embedding",
     "inplace_rope_embedding",
     "precompute_freqs_cis",
+    "RoPEConfig",
+    "RoPEScalingType",
+    "RoPEFrequencyCache",
     
     # LoRA
     "matmul_lora",
@@ -129,19 +188,28 @@ __all__ = [
     "apply_lora_mlp_swiglu",
     "apply_lora_qkv",
     "get_lora_parameters",
+    "torch_amp_custom_fwd",
+    "torch_amp_custom_bwd",
     
     # MoE
-    "GroupedGEMM",
-    "grouped_gemm_forward",
-    "grouped_gemm_backward_dX",
-    "grouped_gemm_backward_dW",
+    "MoEKernelConfig",
     
     # FP8
-    "activation_quant",
-    "weight_dequant",
-    "FP8BlockLinear",
+    "row_quantize_fp8",
+    "block_quantize_fp8",
+    "block_dequantize_fp8",
+    "fp8_gemm_scaled",
+    "FP8Linear",
+    "FP8Format",
+    "FP8Config",
+    "FP8ScaleManager",
+    "get_autotune_config",
     
     # Distributed
     "DistributedKernels",
     "pinned_memory_transfer",
+    "DistributedBackend",
+    "DistributedConfig",
+    "get_distributed_backend",
+    "get_world_info",
 ]
