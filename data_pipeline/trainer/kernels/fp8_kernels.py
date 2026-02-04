@@ -302,7 +302,7 @@ if _TRITON_AVAILABLE:
             tl.store(y_ptrs, y.to(y_ptr.dtype.element_ty), mask=mask)
         
         # Store row scale
-        tl.store(scale_ptr + pid_m, scale)
+        tl.store(scale_ptr + pid_m, tl.max(scale))
 
 
 # ═════════════════════════════════════════════════════════════════════════════════

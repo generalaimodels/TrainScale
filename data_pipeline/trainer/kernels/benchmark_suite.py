@@ -71,6 +71,7 @@ from data_pipeline.trainer.kernels import (
     is_flash_attn_available,
     # RoPE
     fast_rope_embedding,
+    precompute_freqs_cis,
     RoPEConfig,
     # Loss
     fast_cross_entropy_loss,
@@ -230,6 +231,9 @@ class BenchmarkSuite:
         for seq in seq_lens:
             q = torch.randn(1, seq, 32, dim, device=self.device, dtype=torch.float16) # 32 heads
             
+            # Precompute frequencies
+            cos, sin = precompute_freqs_cis(dim, seq, device=self.device, dtype=torch.float16)
+            
             # Baseline: minimal python impl
             def baseline_rope(q, seq):
                # Simplified overhead measure
@@ -238,7 +242,7 @@ class BenchmarkSuite:
             # Since proper RoPE baseline is complex, we stick to measuring raw throughput of ours
             # and compare to a naive clone copy as baseline roughly
             ms_base = self._bench_func(lambda x: x.clone(), (q,)) 
-            ms_our = self._bench_func(fast_rope_embedding, (q, config))
+            ms_our = self._bench_func(fast_rope_embedding, (q, cos, sin))
             
             gb = (q.numel() * 2 * 2) / 1e9 
             
@@ -290,7 +294,7 @@ class BenchmarkSuite:
                 (flops / ms_base / 1e9)
             ))
 
-    def run_cross_entropy(self, vocab_size=128000, batch_tokens=[4096, 32768]):
+    def run_cross_entropy(self, vocab_size=128000, batch_tokens=[4096, 16384]):
         self._print_header("Cross Entropy Loss")
         
         for num_tokens in batch_tokens:
