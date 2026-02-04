@@ -261,8 +261,6 @@ def patch_model(model: nn.Module, model_info: Optional[ModelInfo] = None) -> nn.
     from data_pipeline.trainer.kernels import (
         fast_rms_layernorm,
         swiglu_forward,
-        geglu_forward,
-        flash_attention,
     )
     
     patched_layers = []
