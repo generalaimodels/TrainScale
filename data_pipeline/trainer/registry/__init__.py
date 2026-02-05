@@ -711,25 +711,123 @@ except ImportError as e:
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
+# Kernel Re-exports (Unified Access Point)
+# ═════════════════════════════════════════════════════════════════════════════════
+
+from data_pipeline.trainer.kernels import (
+    # Infrastructure
+    compile_model,
+    CompilationMode,
+    CompilationBackend,
+    PrecisionMode,
+    CompilationConfig,
+    InductorConfig,
+    is_triton_available,
+    get_kernel_capabilities,
+    # Norms & Activations
+    fused_layer_norm,
+    fast_rms_layernorm,
+    fused_add_rms_layernorm,
+    LayerNormConfig,
+    fused_softmax,
+    fused_gelu,
+    swiglu_forward,
+    geglu_forward,
+    fast_cross_entropy_loss,
+    Fast_CrossEntropyLoss,
+    Fast_RMS_LayerNorm,
+    Fast_SwiGLU,
+    Fast_GeGLU,
+    TritonRMSNorm,
+    TritonSwiGLU,
+    TritonGeGLU,
+    # Attention
+    flash_attention,
+    FlashAttention,
+    FlashAttentionConfig,
+    AttentionMaskType,
+    AttentionOutput,
+    MultiHeadFlashAttention,
+    is_flash_attn_available,
+    attention_softcapping_compiled,
+    slow_attention_softcapping,
+    scaled_dot_product_attention,
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+    FlexAttentionConfig,
+    AttentionBackend,
+    BackendCapabilities,
+    # RoPE
+    fast_rope_embedding,
+    Fast_RoPE_Embedding,
+    inplace_rope_embedding,
+    precompute_freqs_cis,
+    RoPEConfig,
+    RoPEScalingType,
+    RoPEFrequencyCache,
+    # LoRA
+    matmul_lora,
+    LoRA_MLP,
+    LoRA_QKV,
+    apply_lora_mlp_swiglu,
+    apply_lora_qkv,
+    get_lora_parameters,
+    torch_amp_custom_fwd,
+    torch_amp_custom_bwd,
+    # MoE
+    supports_tma,
+    MoEKernelConfig,
+    AcceleratorArch,
+    get_accelerator_arch,
+    supports_wgmma,
+    # FP8
+    row_quantize_fp8,
+    block_quantize_fp8,
+    block_dequantize_fp8,
+    fp8_matmul_block_scaled,
+    fp8_matmul_row_scaled,
+    FP8Linear,
+    FP8Format,
+    FP8Config,
+    FP8ScaleManager,
+    # Distributed
+    DistributedKernels,
+    pinned_memory_transfer,
+    DistributedBackend,
+    DistributedConfig,
+    get_distributed_backend,
+    get_world_info,
+)
+
+
+# ═════════════════════════════════════════════════════════════════════════════════
 # Exports
 # ═════════════════════════════════════════════════════════════════════════════════
 
 __all__ = [
-    # Enums
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Registry Enums & Types
+    # ─────────────────────────────────────────────────────────────────────────────
     "QuantType",
     "TrainingMode",
     "QUANT_TAG_MAP",
-    # Classes
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Model Registry Classes
+    # ─────────────────────────────────────────────────────────────────────────────
     "ModelInfo",
     "ModelMeta",
     "KernelPatcher",
-    # Registry
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Registry Functions
+    # ─────────────────────────────────────────────────────────────────────────────
     "MODEL_REGISTRY",
     "register_model",
     "register_models_from_meta",
     "get_model_info",
     "search_models",
-    # Patching
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Layer Patching
+    # ─────────────────────────────────────────────────────────────────────────────
     "LAYER_PATCHES",
     "register_layer_patch",
     "patch_model",
@@ -739,5 +837,102 @@ __all__ = [
     "auto_patch_attention",
     "auto_patch_rope",
     "auto_patch_fp8_linear",
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Kernel Infrastructure (from kernels module)
+    # ─────────────────────────────────────────────────────────────────────────────
+    "compile_model",
+    "CompilationMode",
+    "CompilationBackend",
+    "PrecisionMode",
+    "CompilationConfig",
+    "InductorConfig",
+    "is_triton_available",
+    "get_kernel_capabilities",
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Normalization & Activations (from kernels module)
+    # ─────────────────────────────────────────────────────────────────────────────
+    "fused_layer_norm",
+    "fast_rms_layernorm",
+    "fused_add_rms_layernorm",
+    "LayerNormConfig",
+    "fused_softmax",
+    "fused_gelu",
+    "swiglu_forward",
+    "geglu_forward",
+    "fast_cross_entropy_loss",
+    "Fast_CrossEntropyLoss",
+    "Fast_RMS_LayerNorm",
+    "Fast_SwiGLU",
+    "Fast_GeGLU",
+    "TritonRMSNorm",
+    "TritonSwiGLU",
+    "TritonGeGLU",
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Attention (from kernels module)
+    # ─────────────────────────────────────────────────────────────────────────────
+    "flash_attention",
+    "FlashAttention",
+    "FlashAttentionConfig",
+    "AttentionMaskType",
+    "AttentionOutput",
+    "MultiHeadFlashAttention",
+    "is_flash_attn_available",
+    "attention_softcapping_compiled",
+    "slow_attention_softcapping",
+    "scaled_dot_product_attention",
+    "create_causal_mask",
+    "create_sliding_window_causal_mask",
+    "FlexAttentionConfig",
+    "AttentionBackend",
+    "BackendCapabilities",
+    # ─────────────────────────────────────────────────────────────────────────────
+    # RoPE (from kernels module)
+    # ─────────────────────────────────────────────────────────────────────────────
+    "fast_rope_embedding",
+    "Fast_RoPE_Embedding",
+    "inplace_rope_embedding",
+    "precompute_freqs_cis",
+    "RoPEConfig",
+    "RoPEScalingType",
+    "RoPEFrequencyCache",
+    # ─────────────────────────────────────────────────────────────────────────────
+    # LoRA (from kernels module)
+    # ─────────────────────────────────────────────────────────────────────────────
+    "matmul_lora",
+    "LoRA_MLP",
+    "LoRA_QKV",
+    "apply_lora_mlp_swiglu",
+    "apply_lora_qkv",
+    "get_lora_parameters",
+    "torch_amp_custom_fwd",
+    "torch_amp_custom_bwd",
+    # ─────────────────────────────────────────────────────────────────────────────
+    # MoE (from kernels module)
+    # ─────────────────────────────────────────────────────────────────────────────
+    "supports_tma",
+    "MoEKernelConfig",
+    "AcceleratorArch",
+    "get_accelerator_arch",
+    "supports_wgmma",
+    # ─────────────────────────────────────────────────────────────────────────────
+    # FP8 (from kernels module)
+    # ─────────────────────────────────────────────────────────────────────────────
+    "row_quantize_fp8",
+    "block_quantize_fp8",
+    "block_dequantize_fp8",
+    "fp8_matmul_block_scaled",
+    "fp8_matmul_row_scaled",
+    "FP8Linear",
+    "FP8Format",
+    "FP8Config",
+    "FP8ScaleManager",
+    # ─────────────────────────────────────────────────────────────────────────────
+    # Distributed (from kernels module)
+    # ─────────────────────────────────────────────────────────────────────────────
+    "DistributedKernels",
+    "pinned_memory_transfer",
+    "DistributedBackend",
+    "DistributedConfig",
+    "get_distributed_backend",
+    "get_world_info",
 ]
-
