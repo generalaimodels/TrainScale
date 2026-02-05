@@ -369,9 +369,40 @@ __all__ = [
     "apply_lora",
 ]
 
-def apply_lora(model: nn.Module, config: LoraConfig) -> nn.Module:
+def apply_lora(model: nn.Module, config: Union["LoraConfig", Any]) -> nn.Module:
     """
     Apply LoRA to a model based on the provided configuration.
-    Wrapper around get_peft_model for consistency.
+    
+    Accepts both local LoraConfig and SOTAConfig.LoRAConfig types
+    for flexible integration with the trainer ecosystem.
+    
+    Args:
+        model: The model to apply LoRA to
+        config: LoRA configuration (either lora.LoraConfig or core.sota_config.LoRAConfig)
+    
+    Returns:
+        Model with LoRA adapters applied
     """
-    return get_peft_model(model, config)
+    # Handle different config types by converting to local LoraConfig if needed
+    if isinstance(config, LoraConfig):
+        local_config = config
+    else:
+        # Assume it's a SOTAConfig.LoRAConfig or compatible dataclass
+        # Extract fields that match our local config
+        local_config = LoraConfig(
+            r=getattr(config, 'r', 16),
+            lora_alpha=getattr(config, 'lora_alpha', 32),
+            lora_dropout=getattr(config, 'lora_dropout', 0.0),
+            target_modules=getattr(config, 'target_modules', [
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                "gate_proj", "up_proj", "down_proj",
+            ]),
+            modules_to_save=getattr(config, 'modules_to_save', ["embed_tokens", "lm_head"]),
+            bias=getattr(config, 'bias', "none"),
+            use_rslora=getattr(config, 'use_rslora', False),
+            use_dora=getattr(config, 'use_dora', False),
+            init_lora_weights=getattr(config, 'init_lora_weights', True),
+        )
+    
+    return get_peft_model(model, local_config)
+

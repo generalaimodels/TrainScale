@@ -387,6 +387,7 @@ class SOTATrainer:
                     betas=opt_cfg.betas,
                     eps=opt_cfg.eps,
                     weight_decay=opt_cfg.weight_decay,
+                    percentile_clipping=opt_cfg.percentile_clipping,
                 )
             except ImportError:
                 logger.warning("8-bit Adam not available, falling back to AdamW")
@@ -414,6 +415,7 @@ class SOTATrainer:
                     betas=opt_cfg.betas,
                     eps=opt_cfg.eps,
                     weight_decay=opt_cfg.weight_decay,
+                    max_grad_norm=opt_cfg.max_grad_norm,
                 )
             except ImportError:
                 self.optimizer = torch.optim.AdamW(params, lr=opt_cfg.learning_rate)
@@ -494,6 +496,7 @@ class SOTATrainer:
                 self.loss_fn = ChunkedCrossEntropyLoss(
                     ignore_index=loss_cfg.ignore_index,
                     label_smoothing=loss_cfg.label_smoothing,
+                    reduction=loss_cfg.reduction,
                     chunk_size=loss_cfg.chunk_size,
                 )
             except ImportError:
@@ -506,6 +509,7 @@ class SOTATrainer:
                     gamma=loss_cfg.focal_gamma,
                     alpha=loss_cfg.focal_alpha,
                     ignore_index=loss_cfg.ignore_index,
+                    reduction=loss_cfg.reduction,
                 )
             except ImportError:
                 self.loss_fn = nn.CrossEntropyLoss(ignore_index=loss_cfg.ignore_index)
@@ -513,7 +517,10 @@ class SOTATrainer:
         elif loss_type == LossType.DPO:
             try:
                 from data_pipeline.trainer.loss import DPOLoss
-                self.loss_fn = DPOLoss(beta=loss_cfg.dpo_beta)
+                self.loss_fn = DPOLoss(
+                    beta=loss_cfg.dpo_beta,
+                    label_smoothing=loss_cfg.label_smoothing,
+                )
             except ImportError:
                 raise ImportError("DPO loss requires sota_losses module")
         

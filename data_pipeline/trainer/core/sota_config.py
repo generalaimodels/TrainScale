@@ -184,10 +184,13 @@ class LoRAConfig:
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj"
     ])
+    modules_to_save: List[str] = field(default_factory=lambda: ["embed_tokens", "lm_head"])
     bias: str = "none"
     use_rslora: bool = True
     use_dora: bool = False
+    init_lora_weights: Union[bool, str] = True
     rank_pattern: Dict[str, int] = field(default_factory=dict)
+
 
 
 @dataclass
