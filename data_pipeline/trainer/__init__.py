@@ -208,10 +208,9 @@ from data_pipeline.trainer.loss import (
     DPOLoss,
     ORPOLoss,
     SimPOLoss,
-    ContrastiveLoss,
+    InfoNCELoss,
     ZLoss,
-    CombinedLoss,
-    create_sota_loss,
+    CompositeLoss,
 )
 
 # SOTA Config
@@ -432,10 +431,9 @@ __all__ = [
     "DPOLoss",
     "ORPOLoss",
     "SimPOLoss",
-    "ContrastiveLoss",
+    "InfoNCELoss",
     "ZLoss",
-    "CombinedLoss",
-    "create_sota_loss",
+    "CompositeLoss",
     # SOTA Config
     "SOTAConfig",
     "SOTATrainingMode",

@@ -582,15 +582,56 @@ def create_loss(config: LossConfig) -> nn.Module:
 
 # SOTA Losses (Above Unsloth)
 from data_pipeline.trainer.loss.sota_losses import (
+    # Configuration
+    LossConfig as SOTALossConfig,
+    LossOutput,
+    # Cross Entropy
+    FusedCrossEntropyLoss,
     ChunkedCrossEntropyLoss,
+    PolyLoss,
+    # Knowledge Distillation
     DistillationLoss,
+    FeatureDistillationLoss,
+    AttentionDistillationLoss,
+    # Preference Optimization
     DPOLoss,
+    KTOLoss,
     ORPOLoss,
     SimPOLoss,
-    ContrastiveLoss,
+    CPOLoss,
+    # Contrastive
+    InfoNCELoss,
+    CLIPLoss,
+    TripletLoss,
+    NTXentLoss,
+    SupConLoss,
+    # MoE
     ZLoss,
-    CombinedLoss,
-    create_loss as create_sota_loss,
+    LoadBalancingLoss,
+    ExpertEntropyLoss,
+    # Reconstruction
+    HuberLoss,
+    CharbonnierLoss,
+    PerceptualLoss,
+    # Ranking
+    MarginRankingLoss,
+    ListMLELoss,
+    LambdaRankLoss,
+    # Segmentation
+    DiceLoss,
+    TverskyLoss,
+    FocalTverskyLoss,
+    GHMCLoss,
+    IoULoss,
+    BoundaryLoss,
+    # Composite
+    CompositeLoss,
+    MultiTaskLoss,
+    # Registry
+    LossRegistry,
+    # Utilities
+    compute_log_probs,
+    get_sequence_lengths,
 )
 
 
@@ -599,19 +640,61 @@ from data_pipeline.trainer.loss.sota_losses import (
 # ═════════════════════════════════════════════════════════════════════════════════
 
 __all__ = [
+    # Base losses (this module)
     "CrossEntropyLoss",
     "KLDivergenceLoss",
     "FocalLoss",
     "create_loss",
-    # SOTA (Above Unsloth)
+    # SOTA Losses (from sota_losses.py)
+    # Configuration
+    "SOTALossConfig",
+    "LossOutput",
+    # Cross Entropy
+    "FusedCrossEntropyLoss",
     "ChunkedCrossEntropyLoss",
+    "PolyLoss",
+    # Knowledge Distillation
     "DistillationLoss",
+    "FeatureDistillationLoss",
+    "AttentionDistillationLoss",
+    # Preference Optimization
     "DPOLoss",
+    "KTOLoss",
     "ORPOLoss",
     "SimPOLoss",
-    "ContrastiveLoss",
+    "CPOLoss",
+    # Contrastive
+    "InfoNCELoss",
+    "CLIPLoss",
+    "TripletLoss",
+    "NTXentLoss",
+    "SupConLoss",
+    # MoE
     "ZLoss",
-    "CombinedLoss",
-    "create_sota_loss",
+    "LoadBalancingLoss",
+    "ExpertEntropyLoss",
+    # Reconstruction
+    "HuberLoss",
+    "CharbonnierLoss",
+    "PerceptualLoss",
+    # Ranking
+    "MarginRankingLoss",
+    "ListMLELoss",
+    "LambdaRankLoss",
+    # Segmentation
+    "DiceLoss",
+    "TverskyLoss",
+    "FocalTverskyLoss",
+    "GHMCLoss",
+    "IoULoss",
+    "BoundaryLoss",
+    # Composite
+    "CompositeLoss",
+    "MultiTaskLoss",
+    # Registry
+    "LossRegistry",
+    # Utilities
+    "compute_log_probs",
+    "get_sequence_lengths",
 ]
 
