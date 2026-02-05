@@ -123,6 +123,58 @@ from .distributed_kernels import (
     get_world_info,
 )
 
+
+# ════════════════════════════════════════════════════════════════════════════════
+# Hardware Capability Detection
+# ════════════════════════════════════════════════════════════════════════════════
+
+from typing import Dict
+import torch
+
+def get_kernel_capabilities() -> Dict[str, bool]:
+    """
+    Return dict of available kernel capabilities for current hardware.
+    
+    O(1) complexity with cached device queries.
+    
+    Returns:
+        Dictionary mapping capability names to availability booleans:
+        - triton: Triton JIT compiler available
+        - flash_attn: Flash Attention 2 library available
+        - tma: Tensor Memory Accelerator (Hopper+)
+        - wgmma: Warpgroup MMA (Hopper+)
+        - fp8: FP8 hardware support (SM90+)
+        - cuda: CUDA runtime available
+        - bf16: BF16 hardware support (Ampere+)
+    """
+    cuda_available = torch.cuda.is_available()
+    
+    # Default capabilities when no CUDA
+    if not cuda_available:
+        return {
+            "triton": False,
+            "flash_attn": False,
+            "tma": False,
+            "wgmma": False,
+            "fp8": False,
+            "cuda": False,
+            "bf16": False,
+        }
+    
+    # Get compute capability
+    major, minor = torch.cuda.get_device_capability()
+    
+    return {
+        "triton": is_triton_available(),
+        "flash_attn": is_flash_attn_available(),
+        "tma": supports_tma(),
+        "wgmma": supports_wgmma(),
+        "fp8": major >= 9,  # SM90+ (Hopper)
+        "cuda": True,
+        "bf16": major >= 8,  # SM80+ (Ampere)
+    }
+
+
 __all__ = [
     # Infrastructure
     "compile_model",
@@ -136,6 +188,7 @@ __all__ = [
     "AcceleratorArch",
     "get_accelerator_arch",
     "supports_wgmma",
+    "get_kernel_capabilities",
     
     # Norms & Activations
     "fused_layer_norm",
@@ -213,3 +266,4 @@ __all__ = [
     "get_distributed_backend",
     "get_world_info",
 ]
+
