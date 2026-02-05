@@ -44,8 +44,8 @@ import torch.distributed as dist
 
 from data_pipeline.trainer.distributed import (
     DDPInitializer,
-    create_ddp_from_config,
-    create_fsdp2_from_config,
+    create_ddp_from_yaml,
+    create_fsdp2_from_dict,
     SOTADDP,
     SOTAFSDP2,
     FSDPCheckpointManager,
@@ -214,13 +214,13 @@ class SOTATrainer:
         # SOTA Distributed Wrapping
         if self.distributed_strategy == "ddp":
             logger.info("Applying SOTA DDP wrapper...")
-            self.model = create_ddp_from_config(self.config.to_dict()).wrap_model(self.model)
+            self.model = create_ddp_from_yaml(self.config.to_dict()).wrap_model(self.model)
         
         elif self.distributed_strategy in ("fsdp", "fsdp2", "sota_fsdp"):
             logger.info(f"Applying SOTA FSDP2 wrapper ({self.distributed_strategy})...")
             # FSDP requires model on CPU generally, but SOTA wrapper handles conversion
             # Using to_dict() assuming config object has this method or accessible dict
-            fsdp_wrapper = create_fsdp2_from_config(self.config.to_dict())
+            fsdp_wrapper = create_fsdp2_from_dict(self.config.to_dict())
             self.model = fsdp_wrapper.wrap_model(self.model)
             
             # Ensure optimizer knows about FSDP params if needed
