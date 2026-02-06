@@ -387,7 +387,7 @@ data:
 training:
   output_dir: "./outputs/rocm_sota_run"
   num_train_epochs: 1       # 1 epoch for demo
-  per_device_train_batch_size: 16 # Stable Batch Size
+  per_device_train_batch_size: 32 # Increased for VRAM utilization
   per_device_eval_batch_size: 8
   gradient_accumulation_steps: 4  # Effective global batch 256
   eval_strategy: "steps"    # Changed from 'epochs' for validation loop visibility

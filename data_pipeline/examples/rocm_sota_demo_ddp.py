@@ -60,19 +60,17 @@ from data_pipeline.trainer.distributed import (
     SOTADDP,
     DDPConfig,
     GradientCompression,
-    create_ddp,
-    create_ddp_from_config,
+
     # Utilities
     DistributedState,
-    clip_grad_norm_,
-    set_deterministic_seed,
+
     mixed_precision_context,
     prepare_model_for_distributed,
     prepare_optimizer_for_distributed,
     prepare_scheduler_for_distributed,
     log_rank_0,
     print_rank_0,
-    dist_reduce,
+
 )
 from data_pipeline.trainer.trainers.sota_trainer import create_trainer, SOTATrainer
 
@@ -187,7 +185,7 @@ class SOTADemo:
         self._data_pipeline = None
         
         # Initialize Distributed State (for logging/setup)
-        self.dist_state = DistributedState.initialize()
+        self.dist_state = DistributedState.initialize().unwrap()
         
         log_rank_0(
             f"SOTA DDP Demo initialized: "
