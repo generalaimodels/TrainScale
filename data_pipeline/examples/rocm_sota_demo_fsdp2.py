@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 # ════════════════════════════════════════════════════════════════════════════════
-# SOTA End-to-End Demo for AMD ROCm MI300X Multi-GPU Training
+# SOTA End-to-End Demo for AMD ROCm MI300X Multi-GPU Training - DDP Version
 # ════════════════════════════════════════════════════════════════════════════════
-# Complete pipeline demonstration using TrainScale modules:
+# Complete DDP pipeline demonstration using TrainScale SOTA modules:
 #   - YAML-driven configuration (NO hardcoding)
 #   - AMD ROCm GPU detection via rocm-smi
-#   - Multi-GPU training with 4 middle GPUs (2,3,4,5)
-#   - SOTA model: Mistral-7B / Llama-3.1-8B
-#   - SOTA optimizer: Lion (2x faster than AdamW)
-#   - SOTA scheduler: WSD (LLaMA-3 style Warmup-Stable-Decay)
+#   - Multi-GPU training with DDP (Distributed Data Parallel)
+#   - SOTA model: Mistral-7B / Llama-3.1-8B (registry compatible)
+#   - SOTA optimizer: Lion, CAME, Prodigy (from TrainScale optimizers)
+#   - SOTA scheduler: WSD, REX (from TrainScale schedulers)
 #   - SOTA preprocessing: Token-aware content distribution
 #
 # Usage:
-#   
-#    python rocm_sota_demo.py \
-#       --config rocm_sota_config.yaml
+#   Single GPU:
+#     python rocm_sota_demo_ddp.py --config rocm_sota_config.yaml
 #
-# For distributed multi-GPU:
-#   torchrun --nproc_per_node=4 rocm_sota_demo.py \
-#       --config rocm_sota_config.yaml --distributed
+#   Multi-GPU (4 GPUs):
+#     torchrun --nproc_per_node=4 rocm_sota_demo_ddp.py \
+#        --config rocm_sota_config.yaml
+#
+# Hardware Support:
+#   - AMD: MI300X, MI325X (ROCm/RCCL)
+#   - NVIDIA: A100, H100, H200, B100, B200 (CUDA/NCCL)
 # ════════════════════════════════════════════════════════════════════════════════
 
 from __future__ import annotations
@@ -26,10 +29,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import subprocess
 import sys
 import time
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,19 +45,50 @@ if str(_TRAINSCALE_ROOT) not in sys.path:
 
 import yaml
 import torch
+import torch.distributed as dist
+import torch.nn as nn
 from torch import Tensor
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 
-# Internal SOTA modules
-from data_pipeline.trainer import registry
-from data_pipeline.trainer import lora
-from data_pipeline.trainer.metrics import (
-    MetricCollection,
-    Perplexity,
-    Accuracy,
+# ═════════════════════════════════════════════════════════════════════════════════
+# TrainScale SOTA Imports
+# ═════════════════════════════════════════════════════════════════════════════════
+
+# Distributed (SOTA modules)
+from data_pipeline.trainer.distributed import (
+    # SOTA DDP
+    SOTADDP,
+    DDPConfig,
+    GradientCompression,
+
+    # Utilities
+    DistributedState,
+
+    mixed_precision_context,
+    prepare_model_for_distributed,
+    prepare_optimizer_for_distributed,
+    prepare_scheduler_for_distributed,
+    log_rank_0,
+    print_rank_0,
+
 )
-from data_pipeline.trainer import inference
+from data_pipeline.trainer.trainers.sota_trainer import create_trainer, SOTATrainer
 
+# Registry (model patching)
+from data_pipeline.trainer import registry
+
+# Optimizers (SOTA: Lion, CAME, etc.)
+from data_pipeline.trainer.optimizers import create_optimizer
+
+# Schedulers (SOTA: WSD, REX, etc.)
+from data_pipeline.trainer.schedulers import create_sota_scheduler
+
+# Metrics
+from data_pipeline.trainer.metrics import MetricCollection, Perplexity, Accuracy
+
+# Data Pipeline
+from data_pipeline.pipeline import DataPipeline
+from data_pipeline.core.types import unwrap
 # ═════════════════════════════════════════════════════════════════════════════════
 # Logging Setup
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -66,238 +98,42 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("rocm_sota_demo")
+logger = logging.getLogger("rocm_sota_demo_ddp")
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# AMD ROCm GPU Utilities
-# ═════════════════════════════════════════════════════════════════════════════════
-
-def get_rocm_gpu_info() -> Dict[str, Any]:
-    """
-    Get AMD GPU information using rocm-smi.
-    
-    Returns:
-        Dictionary with GPU information
-    """
-    gpu_info = {
-        "available": False,
-        "count": 0,
-        "devices": [],
-        "driver_version": None,
-        "rocm_version": None,
-    }
-    
-    try:
-        # Check rocm-smi availability
-        result = subprocess.run(
-            ["rocm-smi", "--showid"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        
-        if result.returncode == 0:
-            gpu_info["available"] = True
-            
-            # Parse GPU count and names
-            for line in result.stdout.split("\n"):
-                if "GPU[" in line and "Device Name:" in line:
-                    parts = line.split(":")
-                    if len(parts) >= 2:
-                        device_name = parts[-1].strip()
-                        gpu_idx = int(line.split("GPU[")[1].split("]")[0])
-                        gpu_info["devices"].append({
-                            "id": gpu_idx,
-                            "name": device_name,
-                        })
-            
-            gpu_info["count"] = len(gpu_info["devices"])
-        
-        # Get ROCm version
-        rocm_result = subprocess.run(
-            ["rocm-smi", "--showdriverversion"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if rocm_result.returncode == 0:
-            for line in rocm_result.stdout.split("\n"):
-                if "Driver Version" in line:
-                    parts = line.split(":")
-                    if len(parts) >= 2:
-                        gpu_info["driver_version"] = parts[-1].strip()
-                        break
-                        
-    except FileNotFoundError:
-        logger.warning("rocm-smi not found. AMD GPU detection unavailable.")
-    except subprocess.TimeoutExpired:
-        logger.warning("rocm-smi timed out.")
-    except Exception as e:
-        logger.warning(f"rocm-smi error: {e}")
-    
-    return gpu_info
-
-
-def get_rocm_memory_info(device_ids: List[int] = None) -> Dict[int, Dict[str, float]]:
-    """
-    Get memory usage for specified AMD GPUs.
-    
-    Args:
-        device_ids: List of GPU IDs to query (default: all)
-    
-    Returns:
-        Dictionary mapping device ID to memory info
-    """
-    memory_info = {}
-    
-    try:
-        result = subprocess.run(
-            ["rocm-smi", "--showmeminfo", "vram"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        
-        if result.returncode == 0:
-            current_gpu = None
-            for line in result.stdout.split("\n"):
-                if "GPU[" in line:
-                    gpu_idx = int(line.split("GPU[")[1].split("]")[0])
-                    if device_ids is None or gpu_idx in device_ids:
-                        current_gpu = gpu_idx
-                        memory_info[gpu_idx] = {}
-                elif current_gpu is not None:
-                    if "Total Memory" in line:
-                        parts = line.split(":")
-                        if len(parts) >= 2:
-                            # Parse memory value (e.g., "196560 MB")
-                            mem_str = parts[-1].strip().split()[0]
-                            memory_info[current_gpu]["total_gb"] = float(mem_str) / 1024
-                    elif "Used Memory" in line:
-                        parts = line.split(":")
-                        if len(parts) >= 2:
-                            mem_str = parts[-1].strip().split()[0]
-                            memory_info[current_gpu]["used_gb"] = float(mem_str) / 1024
-                            
-    except Exception as e:
-        logger.warning(f"Memory info error: {e}")
-    
-    return memory_info
-
-
-def setup_rocm_environment(gpu_ids: List[int]) -> None:
-    """
-    Setup environment variables for ROCm multi-GPU training.
-    
-    Args:
-        gpu_ids: List of GPU IDs to use
-    """
-    # Set CUDA_VISIBLE_DEVICES for ROCm (HIP uses CUDA-compatible API)
-    visible_devices = ",".join(str(i) for i in gpu_ids)
-    os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
-    os.environ["HIP_VISIBLE_DEVICES"] = visible_devices
-    
-    # ROCm-specific optimizations
-    os.environ["HSA_FORCE_FINE_GRAIN_PCIE"] = "1"  # Improve PCIe performance
-    os.environ["MIOPEN_DEBUG_DISABLE_FIND_DB"] = "1"  # Faster startup
-    
-    # Enable Flash Attention for ROCm
-    os.environ["FLASH_ATTENTION_USE_TRITON_ROCM"] = "1"
-    
-    logger.info(f"ROCm environment configured for GPUs: {gpu_ids}")
-
-
-def print_rocm_banner(gpu_info: Dict[str, Any], selected_gpus: List[int]) -> None:
-    """Print formatted banner with ROCm GPU information."""
-    print("\n" + "═" * 80)
-    print("🔥 AMD ROCm SOTA Training Demo - TrainScale")
-    print("═" * 80)
-    
-    print(f"\n📊 Detected {gpu_info['count']} AMD GPUs:")
-    for device in gpu_info["devices"]:
-        status = "✅ SELECTED" if device["id"] in selected_gpus else "⬜ Available"
-        print(f"   GPU[{device['id']}]: {device['name']} [{status}]")
-    
-    if gpu_info["driver_version"]:
-        print(f"\n📦 Driver Version: {gpu_info['driver_version']}")
-    
-    memory = get_rocm_memory_info(selected_gpus)
-    if memory:
-        print(f"\n💾 Memory Status:")
-        for gpu_id, mem in memory.items():
-            used = mem.get("used_gb", 0)
-            total = mem.get("total_gb", 0)
-            print(f"   GPU[{gpu_id}]: {used:.1f}/{total:.1f} GB used")
-    
-    print("\n" + "─" * 80)
-
-
-# ═════════════════════════════════════════════════════════════════════════════════
-# SOTA Configuration Loader
+# Configuration Loader
 # ═════════════════════════════════════════════════════════════════════════════════
 
 @dataclass
-class SOTARocmConfig:
-    """
-    SOTA configuration container for ROCm training.
-    
-    Loads from YAML and provides typed access to all settings.
-    """
+class SOTADDPConfig:
+    """SOTA DDP configuration container from YAML."""
     raw: Dict[str, Any] = field(default_factory=dict)
     
     @classmethod
-    def from_yaml(cls, path: str) -> "SOTARocmConfig":
+    def from_yaml(cls, path: str) -> "SOTADDPConfig":
         """Load configuration from YAML file."""
-        # Try resolving path
         p = Path(path)
         if not p.exists():
             # Try relative to script dir
-            script_rel = _SCRIPT_DIR / path
-            if script_rel.exists():
-                p = script_rel
-            # Try relative to examples dir (common pattern)
-            elif (Path("data_pipeline/examples") / path).exists():
-                p = Path("data_pipeline/examples") / path
-            # Try absolute path usage if provided as relative
-            elif (Path(_TRAINSCALE_ROOT) / path).exists():
-                p = Path(_TRAINSCALE_ROOT) / path
-
+            p = _SCRIPT_DIR / path
         if not p.exists():
-            raise FileNotFoundError(f"Config not found: {path} (checked CWD, script dir, and project root)")
+            raise FileNotFoundError(f"Config not found: {path}")
         
-        logger.info(f"Loading config from: {p}")
         with open(p, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
         
-        # Inject config path for later use
         inst = cls(raw=data)
         inst.config_path = str(p)
         return inst
-    
-    # ───────────────────────────────────────────────────────────────────────────
-    # Property Accessors
-    # ───────────────────────────────────────────────────────────────────────────
-    
-    @property
-    def training_mode(self) -> str:
-        return self.raw.get("training_mode", "lora")
     
     @property
     def model(self) -> Dict[str, Any]:
         return self.raw.get("model", {})
     
     @property
-    def tokenizer(self) -> Dict[str, Any]:
-        return self.raw.get("tokenizer", {})
-    
-    @property
-    def dataset(self) -> Dict[str, Any]:
-        return self.raw.get("dataset", {})
-    
-    @property
-    def lora(self) -> Dict[str, Any]:
-        return self.raw.get("lora", {})
+    def distributed(self) -> Dict[str, Any]:
+        return self.raw.get("distributed", {})
     
     @property
     def optimizer(self) -> Dict[str, Any]:
@@ -308,1281 +144,233 @@ class SOTARocmConfig:
         return self.raw.get("scheduler", {})
     
     @property
-    def loss(self) -> Dict[str, Any]:
-        return self.raw.get("loss", {})
-    
-    @property
-    def hardware(self) -> Dict[str, Any]:
-        return self.raw.get("hardware", {})
-    
-    @property
-    def distributed(self) -> Dict[str, Any]:
-        return self.raw.get("distributed", {})
-    
-    @property
     def training(self) -> Dict[str, Any]:
         return self.raw.get("training", {})
     
     @property
-    def kernels(self) -> Dict[str, Any]:
-        return self.raw.get("kernels", {})
-    
-    @property
-    def export(self) -> Dict[str, Any]:
-        return self.raw.get("export", {})
-    
-    @property
-    def preprocessing(self) -> Dict[str, Any]:
-        return self.raw.get("preprocessing", {})
-    
-    @property
-    def prompt_template(self) -> Dict[str, Any]:
-        return self.raw.get("prompt_template", {})
-    
-    @property
     def dataloader(self) -> Dict[str, Any]:
         return self.raw.get("dataloader", {})
-    
-    # ───────────────────────────────────────────────────────────────────────────
-    # Convenience Methods
-    # ───────────────────────────────────────────────────────────────────────────
-    
-    def get_model_name(self) -> str:
-        return self.model.get("name_or_path", "")
-    
-    def get_dataset_name(self) -> str:
-        return self.dataset.get("name", "")
-    
-    def get_max_length(self) -> int:
-        return self.tokenizer.get("max_length", 4096)
-    
-    def get_batch_size(self) -> int:
-        return self.dataloader.get("batch_size", 4)
-    
-    def is_distributed(self) -> bool:
-        return self.distributed.get("enabled", False)
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# SOTA Pipeline Orchestrator
+# SOTA DDP Training Pipeline
 # ═════════════════════════════════════════════════════════════════════════════════
 
-class SOTARocmPipeline:
+class SOTADDPPipeline:
     """
-    Complete SOTA E2E pipeline for AMD ROCm training.
+    Complete SOTA DDP pipeline for multi-GPU training.
     
-    Features:
-    - YAML-driven configuration
-    - Multi-GPU distributed training
-    - SOTA optimizers (Lion, CAME, Prodigy)
-    - SOTA schedulers (WSD, REX)
-    - Flash Attention 2 support for ROCm
-    - Full training + export pipeline
+    Integrates with TrainScale registry for:
+      - Any registered model
+      - SOTA optimizers (Lion, CAME, Prodigy)
+      - SOTA schedulers (WSD, REX)
     """
     
-    def __init__(self, config: SOTARocmConfig, selected_gpus: List[int]):
-        """
-        Initialize pipeline.
-        
-        Args:
-            config: SOTA configuration from YAML
-            selected_gpus: List of GPU IDs to use
-        """
+    def __init__(self, config: SOTADDPConfig):
         self.config = config
-        self.selected_gpus = selected_gpus
         
-        # Components (lazy initialization)
-        self._model = None
-        self._tokenizer = None
-        self._optimizer = None
-        self._scheduler = None
-        self._train_dataloader = None
-        self._eval_dataloader = None
+        # Initialize distributed state from environment
+        self.dist_state = DistributedState.from_environment()
         
-        # Distributed state
-        self._rank = 0
-        self._world_size = len(selected_gpus)
-        self._is_main_process = True
-        
-        logger.info(f"Pipeline initialized: mode={config.training_mode}, gpus={selected_gpus}")
+        # Initialize if not already done
+@dataclass
+class SOTADemo:
+    """
+    SOTA DDP Demo using SOTATrainer and DataPipeline.
+    """
+    config_path: str
     
-    # ═════════════════════════════════════════════════════════════════════════════
-    # Step 0: Distributed Setup
-    # ═════════════════════════════════════════════════════════════════════════════
-    
-    def init_distributed(self):
-        """Initialize distributed training (NCCL) for DDP."""
-        if os.environ.get("RANK") is not None:
-            # We are running with torchrun
-            try:
-                torch.distributed.init_process_group(backend="nccl")
-                local_rank = int(os.environ.get("LOCAL_RANK", 0))
-                torch.cuda.set_device(local_rank)
-                
-                if self._is_rank_0():
-                    logger.info(f"🚀 Distributed Init: World Size={torch.distributed.get_world_size()}, Rank=0")
-            except Exception as e:
-                logger.error(f"Distributed init failed: {e}")
-                raise e
-        else:
-            logger.info("Distributed environment not detected. Running in single-process mode.")
+    def __init__(self, config_path: str):
+        self.config_path = config_path
+        self._data_pipeline = None
+        
+        # Initialize Distributed State (for logging/setup)
+        self.dist_state = DistributedState.initialize().unwrap()
+        
+        log_rank_0(
+            f"SOTA DDP Demo initialized: "
+            f"rank={self.dist_state.rank}/{self.dist_state.world_size}",
+        )
 
-    def _is_rank_0(self):
-        return not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
 
-    # ═════════════════════════════════════════════════════════════════════════════
-    # Step 1: Load Dataset with Introspection
-    # ═════════════════════════════════════════════════════════════════════════════
-    
-    def load_dataset(self, split: str = "train") -> Any:
-        """
-        Load dataset with auto-discovery.
-        
-        Args:
-            split: Split name from config
-        
-        Returns:
-            HuggingFace Dataset
-        """
-        from data_pipeline.introspection import DatasetIntrospector
-        from data_pipeline.core.types import is_err
-        from datasets import load_dataset
-        
-        dataset_name = self.config.get_dataset_name()
-        splits = self.config.dataset.get("splits", {})
-        split_config = splits.get(split, {})
-        
-        logger.info(f"Loading dataset: {dataset_name}")
-        
-        # Introspect first
-        introspector = DatasetIntrospector()
-        result = introspector.discover(
-            dataset_name,
-            trust_remote_code=self.config.raw.get("introspection", {}).get("trust_remote_code", True),
-        )
-        
-        if not is_err(result):
-            metadata = result.value
-            logger.info(f"Discovered splits: {list(metadata.get_all_splits())}")
-            logger.info(f"Discovered columns: {[f.name for f in metadata.features]}")
-        
-        # Load dataset
-        hf_split = split_config.get("name", split)
-        sample_size = split_config.get("sample_size")
-        
-        split_str = hf_split
-        if sample_size:
-            split_str = f"{hf_split}[:{sample_size}]"
-        
-        ds = load_dataset(
-            dataset_name,
-            name=self.config.dataset.get("config_name"),
-            split=split_str,
-            trust_remote_code=True,
-        )
-        
-        # Shuffle if configured
-        if split_config.get("shuffle", False):
-            ds = ds.shuffle(seed=split_config.get("seed", 42))
-        
-        logger.info(f"Loaded {len(ds)} examples from '{split}'")
-        return ds
-    
-    # ═════════════════════════════════════════════════════════════════════════════
-    # Step 2: Initialize Tokenizer
-    # ═════════════════════════════════════════════════════════════════════════════
-    
-    def init_tokenizer(self):
-        """
-        Initialize tokenizer with SOTA settings.
-        
-        Returns:
-            HuggingFace Tokenizer
-        """
-        from transformers import AutoTokenizer
-        
-        tok_cfg = self.config.tokenizer
-        model_name = tok_cfg.get("name_or_path") or self.config.get_model_name()
-        
-        logger.info(f"Loading tokenizer: {model_name}")
-        
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
-            trust_remote_code=True,
-            use_fast=tok_cfg.get("use_fast", True),
-        )
-        
-        # Set special tokens
-        if tok_cfg.get("add_pad_token", True) and tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        
-        tokenizer.padding_side = tok_cfg.get("padding_side", "right")
-        tokenizer.truncation_side = tok_cfg.get("truncation_side", "right")
-        
-        self._tokenizer = tokenizer
-        logger.info(f"Tokenizer ready: vocab_size={tokenizer.vocab_size}")
-        
-        return tokenizer
-    
-    # ═════════════════════════════════════════════════════════════════════════════
-    # Step 3: Initialize Model with SOTA Training Mode
-    # ═════════════════════════════════════════════════════════════════════════════
-    
-    def init_model(self):
-        """
-        Initialize SOTA model with LoRA/QLoRA.
-        
-        Returns:
-            Model ready for training
-        """
-        from transformers import AutoModelForCausalLM, BitsAndBytesConfig
-        
-        model_cfg = self.config.model
-        model_name = self.config.get_model_name()
-        training_mode = self.config.training_mode
-        
-        logger.info(f"Loading model: {model_name}")
-        logger.info(f"Training mode: {training_mode}")
-        
-        # Quantization config for QLoRA
-        bnb_config = None
-        quant_cfg = self.config.raw.get("quantization", {})
-        if quant_cfg.get("enabled", False):
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=quant_cfg.get("load_in_4bit", True),
-                bnb_4bit_quant_type=quant_cfg.get("bnb_4bit_quant_type", "nf4"),
-                bnb_4bit_compute_dtype=getattr(
-                    torch, 
-                    quant_cfg.get("bnb_4bit_compute_dtype", "bfloat16")
-                ),
-                bnb_4bit_use_double_quant=quant_cfg.get("bnb_4bit_use_double_quant", True),
-            )
-            logger.info("QLoRA quantization enabled (NF4)")
-        
-        # Load model
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            revision=model_cfg.get("revision", "main"),
-            trust_remote_code=model_cfg.get("trust_remote_code", True),
-            torch_dtype=getattr(torch, model_cfg.get("torch_dtype", "bfloat16")),
-            low_cpu_mem_usage=model_cfg.get("low_cpu_mem_usage", True),
-            attn_implementation=model_cfg.get("attn_implementation", "flash_attention_2"),
-            quantization_config=bnb_config,
-            device_map="auto" if len(self.selected_gpus) == 1 else None,
-        )
-        
-        # Apply SOTA patches from registry (Triton kernels)
-        logger.info("Checking registry for SOTA patches...")
-        if registry.get_model_info(model_name) or True: # Force check
-            registry.patch_model(model)
-        
-        # Apply LoRA if enabled
-        if training_mode in ("lora", "qlora"):
-            model = self._apply_lora(model)
-        
-        # Enable gradient checkpointing
-        if self.config.distributed.get("gradient_checkpointing", True):
-            if hasattr(model, "gradient_checkpointing_enable"):
-                model.gradient_checkpointing_enable(
-                    gradient_checkpointing_kwargs={"use_reentrant": False}
-                )
-                logger.info("Gradient checkpointing enabled")
-        
-        self._model = model
-        return model
-    
-    def _apply_lora(self, model):
-        """Apply LoRA/QLoRA to model using internal SOTA module."""
-        logger.info("Applying internal SOTA LoRA...")
-        
-        lora_cfg = self.config.lora
-        
-        # Create config
-        config = lora.LoraConfig(
-            r=lora_cfg.get("r", 64),
-            lora_alpha=lora_cfg.get("lora_alpha", 128),
-            lora_dropout=lora_cfg.get("lora_dropout", 0.05),
-            target_modules=lora_cfg.get("target_modules", [
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj"
-            ]),
-            bias=lora_cfg.get("bias", "none"),
-            use_rslora=lora_cfg.get("use_rslora", True),
-            use_dora=lora_cfg.get("use_dora", False),
-        )
-        
-        # Apply LoRA
-        model = lora.get_peft_model(model, config)
-        
-        # Print stats
-        lora.print_trainable_parameters(model)
-        
-        return model
-    
-    # ═════════════════════════════════════════════════════════════════════════════
-    # Step 4: Create SOTA Optimizer
-    # ═════════════════════════════════════════════════════════════════════════════
-    
-    def init_optimizer(self):
-        """
-        Initialize SOTA optimizer.
-        
-        Supports: AdamW, Lion, CAME, SophiaG, Prodigy, Adam8bit
-        
-        Returns:
-            Optimizer instance
-        """
-        from data_pipeline.trainer.optimizers import create_optimizer
-        
-        opt_cfg = self.config.optimizer
-        opt_type = opt_cfg.get("type", "lion").lower()
-        
-        logger.info(f"Initializing SOTA optimizer: {opt_type}")
-        
-        trainable_params = [p for p in self._model.parameters() if p.requires_grad]
-        
-        # Use TrainScale's SOTA optimizer factory
-        # Prepare optimizer args
-        opt_kwargs = {
-            "name": opt_type,
-            "params": trainable_params,
-            "lr": opt_cfg.get("learning_rate", 3e-5),
-            "weight_decay": opt_cfg.get("weight_decay", 0.1),
-        }
-        
-        # Handle optimizer-specific args
-        if opt_type == "lion":
-            opt_kwargs["betas"] = tuple(opt_cfg.get("lion_betas", [0.9, 0.99]))
-        else:
-            opt_kwargs["betas"] = tuple(opt_cfg.get("betas", [0.9, 0.999]))
-            opt_kwargs["eps"] = opt_cfg.get("eps", 1e-8)
-
-        try:
-            self._optimizer = create_optimizer(**opt_kwargs)
-        except Exception as e:
-            logger.warning(f"SOTA optimizer failed: {e}, falling back to AdamW")
-            self._optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=opt_cfg.get("learning_rate", 3e-5),
-                weight_decay=opt_cfg.get("weight_decay", 0.1),
-            )
-        
-        logger.info(f"Optimizer: {type(self._optimizer).__name__}")
-        return self._optimizer
-    
-    # ═════════════════════════════════════════════════════════════════════════════
-    # Step 5: Create SOTA Scheduler
-    # ═════════════════════════════════════════════════════════════════════════════
-    
-    def init_scheduler(self, num_training_steps: int):
-        """
-        Initialize SOTA scheduler.
-        
-        Supports: Cosine, WSD (LLaMA-3), REX, OneCycle
-        
-        Args:
-            num_training_steps: Total training steps
-        
-        Returns:
-            Scheduler instance
-        """
-        from data_pipeline.trainer.schedulers import create_sota_scheduler
-        
-        sch_cfg = self.config.scheduler
-        sch_type = sch_cfg.get("type", "wsd").lower()
-        
-        warmup_steps = sch_cfg.get("warmup_steps", 0)
-        if warmup_steps == 0:
-            warmup_steps = int(sch_cfg.get("warmup_ratio", 0.03) * num_training_steps)
-        
-        logger.info(f"Initializing SOTA scheduler: {sch_type}")
-        logger.info(f"Warmup steps: {warmup_steps}, Total steps: {num_training_steps}")
-        
-        try:
-            self._scheduler = create_sota_scheduler(
-                name=sch_type,
-                optimizer=self._optimizer,
-                num_training_steps=num_training_steps,
-                warmup_steps=warmup_steps,
-                min_lr_ratio=sch_cfg.get("min_lr_ratio", 0.1),
-                stable_ratio=sch_cfg.get("stable_ratio", 0.85),
-            )
-        except Exception as e:
-            logger.warning(f"SOTA scheduler failed: {e}, using cosine")
-            from torch.optim.lr_scheduler import CosineAnnealingLR
-            self._scheduler = CosineAnnealingLR(
-                self._optimizer,
-                T_max=num_training_steps - warmup_steps,
-            )
-        
-        logger.info(f"Scheduler: {type(self._scheduler).__name__}")
-        return self._scheduler
-    
-    # ═════════════════════════════════════════════════════════════════════════════
-    # Step 6: Preprocess Dataset (SOTA)
-    # ═════════════════════════════════════════════════════════════════════════════
-    
-    def preprocess_dataset(self, dataset):
-        """
-        Apply SOTA preprocessing to dataset.
-        
-        Features:
-        - Token-aware length management
-        - Smart truncation (sentence/word boundaries)
-        - Per-column limits
-        - Sequence packing
-        
-        Args:
-            dataset: Raw HuggingFace dataset
-        
-        Returns:
-            Preprocessed dataset with input_ids, attention_mask, labels
-        """
-        from data_pipeline.preprocessing import (
-            PromptEngine,
-            create_length_manager,
-            TokenAwareContentDistributor,
-            ContentDistributionMode,
-        )
-        from data_pipeline.core.config_schema import PromptTemplate
-        from data_pipeline.core.types import is_err
-        
-        logger.info("Applying SOTA preprocessing...")
-        
-        pt_cfg = self.config.prompt_template
-        prep_cfg = self.config.preprocessing
-        max_length = self.config.get_max_length()
-        tokenizer = self._tokenizer
-        
-        # Length manager
-        length_manager = None
-        lm_cfg = prep_cfg.get("length_manager", {})
-        if lm_cfg.get("enabled", True):
-            length_manager = create_length_manager(
-                max_length=lm_cfg.get("max_total_length", max_length),
-                padding_strategy=lm_cfg.get("padding_strategy", "longest"),
-                default_truncation=lm_cfg.get("truncation_strategy", "smart"),
-                per_column_limits=lm_cfg.get("per_column_limits", {}),
-            )
-            logger.info(f"Length manager: max={max_length}")
-        
-        # Process function for chat datasets
-        def process_chat_example(example):
-            """Process chat-format dataset (messages)."""
-            messages = example.get("messages", [])
-            
-            input_ids = []
-            labels = []
-            
-            # Start with BOS if needed (Mistral usually adds it, but we build manually)
-            # tokenizer.bos_token_id is usually 1
-            if tokenizer.bos_token_id is not None:
-                input_ids.append(tokenizer.bos_token_id)
-                labels.append(-100) # Mask BOS
-            
-            for msg in messages:
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                
-                # Format segments (Mistral format: [INST] ... [/INST] or similar)
-                # But for generic SOTA demo, we'll use a simple format or strict tokenizer chat template if available.
-                # Let's use the format we used before but build token by token.
-                
-                if role in ("user", "human"):
-                    prefix = "### Human: "
-                    text = f"{prefix}{content}\n\n"
-                    tokens = tokenizer.encode(text, add_special_tokens=False)
-                    input_ids.extend(tokens)
-                    labels.extend([-100] * len(tokens)) # Mask user
-                    
-                elif role in ("assistant", "gpt"):
-                    prefix = "### Assistant: "
-                    text = f"{prefix}{content}\n\n"
-                    tokens = tokenizer.encode(text, add_special_tokens=False)
-                    input_ids.extend(tokens)
-                    
-                    # Mask prefix, keep content? Or keep all?
-                    # Usually we mask "### Assistant: " and keep content.
-                    prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
-                    content_len = len(tokens) - len(prefix_tokens)
-                    
-                    # Heuristic: Mask header, keep response
-                    header_len = len(prefix_tokens)
-                    labels.extend([-100] * header_len)
-                    labels.extend(tokens[header_len:])
-                    
-                elif role == "system":
-                    prefix = "### System: "
-                    text = f"{prefix}{content}\n\n"
-                    tokens = tokenizer.encode(text, add_special_tokens=False)
-                    input_ids.extend(tokens)
-                    labels.extend([-100] * len(tokens)) # Mask system
-            
-            # Truncate/Pad
-            if len(input_ids) > max_length:
-                input_ids = input_ids[:max_length]
-                labels = labels[:max_length]
-            else:
-                pad_len = max_length - len(input_ids)
-                input_ids.extend([tokenizer.pad_token_id] * pad_len)
-                labels.extend([-100] * pad_len)
-            
-            return {
-                "input_ids": input_ids,
-                "attention_mask": [1 if i != tokenizer.pad_token_id else 0 for i in input_ids],
-                "labels": labels,
-            }
-        
-        # Process instruction datasets (Alpaca format)
-        def process_instruction_example(example):
-            """Process instruction-format dataset."""
-            instruction = example.get("instruction", "")
-            input_text = example.get("input", "")
-            output = example.get("output", "")
-            
-            # Build prompt
-            if input_text:
-                prompt = f"### Instruction:\n{instruction}\n\n### Input:\n{input_text}\n\n### Response:\n{output}"
-            else:
-                prompt = f"### Instruction:\n{instruction}\n\n### Response:\n{output}"
-            
-            tokenized = tokenizer(
-                prompt,
-                max_length=max_length,
-                truncation=True,
-                padding="max_length",
-                return_tensors=None,
-            )
-            
-            # Create labels
-            labels = tokenized["input_ids"].copy()
-            
-            # Mask input portion
-            response_start = prompt.find("### Response:") + len("### Response:\n")
-            input_portion = prompt[:response_start]
-            input_tokens = tokenizer.encode(input_portion, add_special_tokens=True)
-            
-            for i in range(min(len(input_tokens), len(labels))):
-                labels[i] = -100
-            
-            return {
-                "input_ids": tokenized["input_ids"],
-                "attention_mask": tokenized["attention_mask"],
-                "labels": labels,
-            }
-        
-        # Detect dataset format and process
-        sample = dataset[0] if len(dataset) > 0 else {}
-        
-        if "messages" in sample:
-            process_fn = process_chat_example
-            logger.info("Detected chat format (messages)")
-        elif "instruction" in sample:
-            process_fn = process_instruction_example
-            logger.info("Detected instruction format")
-        elif "text" in sample:
-            # Simple text completion
-            def process_text_example(example):
-                text = example.get("text", "")
-                tokenized = tokenizer(
-                    text,
-                    max_length=max_length,
-                    truncation=True,
-                    padding="max_length",
-                    return_tensors=None,
-                )
-                return {
-                    "input_ids": tokenized["input_ids"],
-                    "attention_mask": tokenized["attention_mask"],
-                    "labels": tokenized["input_ids"].copy(),
-                }
-            process_fn = process_text_example
-            logger.info("Detected text format")
-        else:
-            raise ValueError(f"Unknown dataset format. Columns: {list(sample.keys())}")
-        
-        # Map processing function
-        processed = dataset.map(
-            process_fn,
-            remove_columns=dataset.column_names,
-            desc="SOTA Preprocessing",
-            num_proc=1,
-        )
-        
-        logger.info(f"Preprocessing complete: {len(processed)} examples")
-        
-        return processed
-    
-    # ═════════════════════════════════════════════════════════════════════════════
-    # Step 6: Create DataLoaders
-    # ═════════════════════════════════════════════════════════════════════════════
-    
-    def create_dataloader(self, dataset, shuffle: bool = True) -> DataLoader:
-        """
-        Create optimized DataLoader with DistributedSampler support.
-        """
-        from data_pipeline.data import DataLoaderBuilder
-        from data_pipeline.core.config_schema import DataLoaderConfig
-        from torch.utils.data.distributed import DistributedSampler
-        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-        
-        dl_cfg = self.config.dataloader
-        
-        # Collate function
-        def collate_fn(batch):
-            input_ids = torch.tensor([x["input_ids"] for x in batch], dtype=torch.long)
-            attention_mask = torch.tensor([x["attention_mask"] for x in batch], dtype=torch.long)
-            labels = torch.tensor([x["labels"] for x in batch], dtype=torch.long)
-            
-            return {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-            }
-        
-        # DDP Sampler
-        sampler = None
-        if torch.distributed.is_initialized():
-            sampler = DistributedSampler(
-                dataset,
-                num_replicas=torch.distributed.get_world_size(),
-                rank=torch.distributed.get_rank(),
-                shuffle=shuffle,
-                drop_last=dl_cfg.get("drop_last", False)
-            )
-            shuffle = False # Sampler handles shuffling
-        
-        dataloader = DataLoader(
-            dataset,
-            batch_size=dl_cfg.get("batch_size", 4),
-            shuffle=shuffle,
-            sampler=sampler,
-            num_workers=dl_cfg.get("num_workers", 4), # Strict: enforce workers
-            pin_memory=True, # Strict: enforce pinning
-            drop_last=dl_cfg.get("drop_last", False),
-            collate_fn=collate_fn,
-        )
-        
-        logger.info(f"DataLoader: {len(dataloader)} batches, batch_size={dl_cfg.get('batch_size', 4)}, distributed={sampler is not None}")
-        
-        return dataloader
-    
-    # ═════════════════════════════════════════════════════════════════════════════
-    # Step 7: Training Loop
-    # ═════════════════════════════════════════════════════════════════════════════
-    
-    def train(self, train_dataloader: DataLoader, eval_dataloader: Optional[DataLoader] = None):
-        """
-        Execute SOTA training loop with DDP and Throughput Logging.
-        """
-        from data_pipeline.trainer import is_main_process
-        
-        train_cfg = self.config.training
-        
-        # Calculate training steps
-        num_epochs = train_cfg.get("num_train_epochs", 1)
-        max_steps = train_cfg.get("max_steps", -1)
-        grad_accum = train_cfg.get("gradient_accumulation_steps", 4)
-        
-        # Adjust steps for distributed
-        num_devices = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-        steps_per_epoch = len(train_dataloader) // grad_accum
-        total_steps = steps_per_epoch * num_epochs
-        
-        if max_steps > 0:
-            total_steps = min(total_steps, max_steps)
-        
-        # NOTE: Scheduler init moved to AFTER model wrapping for FSDP support
-        
-        # Setup mixed precision
-        hw_cfg = self.config.hardware
-        precision = hw_cfg.get("precision", "bf16")
-        
-        if precision == "bf16":
-            amp_dtype = torch.bfloat16
-        elif precision == "fp16":
-            amp_dtype = torch.float16
-        else:
-            amp_dtype = torch.float32
-        
-        use_amp = precision != "fp32"
-        scaler = torch.cuda.amp.GradScaler() if precision == "fp16" else None
-        
-        # Move model to device
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-        self._model = self._model.to(device)
-        
-        # FSDP Wrapper - Using SOTA FSDP2 from TrainScale distributed
-        if torch.distributed.is_initialized():
-            logger.info(f"🚀 Wrapping model with SOTA FSDP2 (Rank {torch.distributed.get_rank()})")
-            
-            # Import SOTA FSDP2 module
-            from data_pipeline.trainer.distributed import (
-                create_fsdp2_from_config,
-                FSDP2Config,
-                ShardingStrategy as SOTAShardingStrategy,
-            )
-            
-            # Create FSDP2 from YAML config (fully generalized)
-            sota_fsdp = create_fsdp2_from_config(self.config.raw)
-            
-            # Wrap model with SOTA FSDP2
-            # Note: FSDP2 uses use_orig_params=True by default (critical for LoRA)
-            self._model = sota_fsdp.wrap_model(self._model)
-            
-            # Store reference for gradient clipping
-            self._sota_fsdp = sota_fsdp
-
-        # Initialize scheduler & optimizer AFTER model wrap (Critical for FSDP)
-        self.init_scheduler(total_steps)
-        
-        if self._is_rank_0():
-            logger.info("=" * 60)
-            logger.info("🚀 Starting SOTA Training (DDP)")
-            logger.info("=" * 60)
-            logger.info(f"   Total epochs: {num_epochs}")
-            logger.info(f"   Total steps: {total_steps}")
-            logger.info(f"   World Size: {num_devices}")
-            logger.info(f"   Batch size (local): {train_dataloader.batch_size}")
-            logger.info(f"   Global Batch Size: {train_dataloader.batch_size * num_devices * grad_accum}")
-            logger.info(f"   Gradient accumulation: {grad_accum}")
-            logger.info(f"   Precision: {precision}")
-            logger.info("=" * 60)
-        
-        self._model.train()
-        global_step = 0
-        total_loss = 0.0
-        
-        # Restore config variables
-        max_grad_norm = self.config.optimizer.get("max_grad_norm", 1.0)
-        logging_steps = train_cfg.get("logging_steps", 10)
-        save_steps = train_cfg.get("save_steps", 100)
-        output_dir = train_cfg.get("output_dir", "./outputs")
-        
-        if self._is_rank_0():
-            os.makedirs(output_dir, exist_ok=True)
-        
-        # Initialize counters for manual metrics
-        running_loss = 0.0
-        running_correct = 0.0
-        running_total = 0.0
-        
-        # Throughput counters
-        tokens_processed = 0
-        start_time = time.time()
-        
-        for epoch in range(num_epochs):
-            if torch.distributed.is_initialized() and hasattr(train_dataloader.sampler, 'set_epoch'):
-                train_dataloader.sampler.set_epoch(epoch)
-                
-            epoch_loss = 0.0
-            
-            for step, batch in enumerate(train_dataloader):
-                # Move batch to device
-                batch = {k: v.to(device) for k, v in batch.items()}
-                
-                # Update throughput counter
-                # batch['input_ids'] is [B, T]
-                tokens_processed += batch['input_ids'].numel()
-                
-                # Mixed precision
-                if use_amp:
-                    with torch.amp.autocast("cuda", dtype=amp_dtype):
-                        outputs = self._model(
-                            input_ids=batch["input_ids"],
-                            attention_mask=batch["attention_mask"],
-                            labels=batch.get("labels"),
-                        )
-                        
-                        # Metrics Calculation
-                        shift_logits = outputs.logits[..., :-1, :].contiguous()
-                        shift_labels = batch["labels"][..., 1:].contiguous()
-                        
-                        flat_logits = shift_logits.view(-1, shift_logits.size(-1))
-                        flat_labels = shift_labels.view(-1)
-                        mask = flat_labels != -100
-                        
-                        n_tokens = mask.sum()
-                        if n_tokens > 0:
-                            valid_logits = flat_logits[mask]
-                            valid_labels = flat_labels[mask]
-                            
-                            step_loss_sum = torch.nn.functional.cross_entropy(valid_logits, valid_labels, reduction='sum')
-                            step_correct = (valid_logits.argmax(dim=-1) == valid_labels).sum()
-                            
-                            running_loss += step_loss_sum.item()
-                            running_correct += step_correct.item()
-                            running_total += n_tokens.item()
-
-                        if hasattr(outputs, "loss"):
-                            loss = outputs.loss
-                        else:
-                            loss = outputs[0]
-                            
-                        loss = loss / grad_accum
-                else:
-                    outputs = self._model(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                        labels=batch.get("labels"),
-                    )
-                    
-                    # Metrics
-                    shift_logits = outputs.logits[..., :-1, :].contiguous()
-                    shift_labels = batch["labels"][..., 1:].contiguous()
-                    
-                    flat_logits = shift_logits.view(-1, shift_logits.size(-1))
-                    flat_labels = shift_labels.view(-1)
-                    mask = flat_labels != -100
-                    
-                    n_tokens = mask.sum()
-                    if n_tokens > 0:
-                        valid_logits = flat_logits[mask]
-                        valid_labels = flat_labels[mask]
-                        
-                        step_loss_sum = torch.nn.functional.cross_entropy(valid_logits, valid_labels, reduction='sum')
-                        step_correct = (valid_logits.argmax(dim=-1) == valid_labels).sum()
-                        
-                        running_loss += step_loss_sum.item()
-                        running_correct += step_correct.item()
-                        running_total += n_tokens.item()
-
-                    if hasattr(outputs, "loss"):
-                        loss = outputs.loss
-                    else:
-                        loss = outputs[0]
-                        
-                    loss = loss / grad_accum
-                
-                # Backward
-                if scaler:
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
-                
-                epoch_loss += loss.item() * grad_accum
-                total_loss += loss.item() * grad_accum
-                
-                # Optimizer step
-                if (step + 1) % grad_accum == 0:
-                    if scaler:
-                        scaler.unscale_(self._optimizer)
-                    
-                    torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
-                    
-                    if scaler:
-                        scaler.step(self._optimizer)
-                        scaler.update()
-                    else:
-                        self._optimizer.step()
-                    
-                    self._scheduler.step()
-                    self._optimizer.zero_grad()
-                    global_step += 1
-                    
-                    # Logging (Rank 0 only)
-                    if global_step % 10 == 0: # Hardcoded 10 for demo responsiveness
-                        lr = self._scheduler.get_last_lr()[0]
-                        elapsed = time.time() - start_time
-                        
-                         # Sync tokens processed
-                        tokens_tensor = torch.tensor([tokens_processed], device=device, dtype=torch.long)
-                        if torch.distributed.is_initialized():
-                            torch.distributed.all_reduce(tokens_tensor, op=torch.distributed.ReduceOp.SUM)
-                        global_tokens = tokens_tensor.item()
-                        tokens_per_sec = global_tokens / elapsed
-
-                        # Aggregated Metrics
-                        metrics_tensor = torch.tensor(
-                            [running_loss, running_correct, running_total], 
-                            device=device
-                        )
-                        if torch.distributed.is_initialized():
-                            torch.distributed.all_reduce(metrics_tensor, op=torch.distributed.ReduceOp.SUM)
-                        
-                        global_loss_sum = metrics_tensor[0].item()
-                        global_correct = metrics_tensor[1].item()
-                        global_total = metrics_tensor[2].item()
-                        
-                        avg_ppl_loss = global_loss_sum / max(1, global_total)
-                        ppl = math.exp(min(avg_ppl_loss, 100))
-                        acc = global_correct / max(1, global_total)
-                        
-                        running_loss = 0.0
-                        running_correct = 0.0
-                        running_total = 0.0
-                        
-                        if self._is_rank_0():
-                            logger.info(
-                                f"Step {global_step}/{total_steps} | "
-                                f"Loss: {avg_ppl_loss:.4f} | "
-                                f"PPL: {ppl:.2f} | "
-                                f"Acc: {acc:.2%} | "
-                                f"LR: {lr:.2e} | "
-                                f"Tok/s: {tokens_per_sec:.0f}"
-                            )
-                    
-                    if global_step % save_steps == 0 and self._is_rank_0():
-                        self._save_checkpoint(output_dir, global_step)
-                
-                if max_steps > 0 and global_step >= max_steps:
-                    break
-            
-            if self._is_rank_0():
-                avg_epoch_loss = epoch_loss / len(train_dataloader)
-                logger.info(f"Epoch {epoch + 1}/{num_epochs} completed | Loss: {avg_epoch_loss:.4f}")
-            
-            if max_steps > 0 and global_step >= max_steps:
-                break
-        
-        # Final save
-        if self._is_rank_0():
-            self._save_checkpoint(output_dir, global_step, is_final=True)
-        
-        total_time = time.time() - start_time
-        metrics = {
-            "train_loss": total_loss / global_step,
-            "total_steps": global_step,
-            "training_time_hours": total_time / 3600,
-        }
-        
-        logger.info("=" * 60)
-        logger.info("✅ Training Complete!")
-        logger.info(f"   Final loss: {metrics['train_loss']:.4f}")
-        logger.info(f"   Total steps: {global_step}")
-        logger.info(f"   Training time: {total_time/3600:.2f} hours")
-        logger.info("=" * 60)
-        
-        return metrics
-    
-    def _save_checkpoint(self, output_dir: str, step: int, is_final: bool = False):
-        """Save SOTA checkpoint (FSDP safe)."""
-        save_path = os.path.join(output_dir, f"checkpoint-{step}")
-        if is_final:
-            save_path = os.path.join(output_dir, "rocm_sota_export")
-            
-        logger.info(f"💾 Saving checkpoint to {save_path}...")
-        
-        # FSDP Saving Logic
-        from torch.distributed.fsdp import (
-            FullyShardedDataParallel as FSDP,
-            FullStateDictConfig,
-            StateDictType,
-        )
-        
-        if torch.distributed.is_initialized() and isinstance(self._model, FSDP):
-             # FSDP: Consolidate state dict on rank 0
-             save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-             with FSDP.state_dict_type(self._model, StateDictType.FULL_STATE_DICT, save_policy):
-                cpu_state = self._model.state_dict()
-                
-             if self._is_rank_0():
-                 # Use save_pretrained with state_dict argument to save consolidated weights
-                 self._model.save_pretrained(save_path, state_dict=cpu_state)
-                 if self._tokenizer:
-                    self._tokenizer.save_pretrained(save_path)
-        else:
-            # Fallback for single GPU or DDP (if FSDP not active)
-            if self._is_rank_0():
-                model_to_save = self._model.module if hasattr(self._model, "module") else self._model
-                model_to_save.save_pretrained(save_path)
-                if self._tokenizer:
-                    self._tokenizer.save_pretrained(save_path)
-        
-        if self._is_rank_0():
-            logger.info(f"Checkpoint saved: {save_path}")
-    
-    # ═════════════════════════════════════════════════════════════════════════════
-    # Full Pipeline Execution
-    # ═════════════════════════════════════════════════════════════════════════════
-    
-    def run(self) -> Dict[str, Any]:
-        """
-        Execute complete SOTA training pipeline.
-        
-        Returns:
-            Training results and metrics
-        """
-        logger.info("=" * 60)
-        logger.info("🔥 SOTA E2E Pipeline - AMD ROCm MI300X")
-        logger.info("=" * 60)
-        
-        # Step 0: Initialize Distributed Environment
-        self.init_distributed()
-        
-        # Step 1: Load datasets
-        logger.info("\n📂 Step 1: Loading Dataset...")
-        train_dataset = self.load_dataset("train")
-        
-        # Limit samples if requested
-        max_samples = self.config.raw.get("max_samples", -1)
-        # Also check cli override via config update (hacky, checking attr directly is better if passed)
-        
-        if hasattr(self.config, "max_samples") and self.config.max_samples > 0:
-             max_samples = self.config.max_samples
-             
-        if max_samples > 0:
-            logger.info(f"⚠️ Limiting training samples to {max_samples} for debugging")
-            train_dataset = train_dataset.select(range(min(len(train_dataset), max_samples)))
-        
-        eval_dataset = None
-        splits = self.config.dataset.get("splits", {})
-        if "validation" in splits or "test" in splits:
-            eval_split = "validation" if "validation" in splits else "test"
-            try:
-                eval_dataset = self.load_dataset(eval_split)
-            except Exception as e:
-                logger.warning(f"Could not load eval dataset: {e}")
-        
-        # Step 2: Initialize tokenizer
-        logger.info("\n🔤 Step 2: Initializing Tokenizer...")
-        self.init_tokenizer()
-        
-        # Step 3: Initialize model
-        logger.info("\n🧠 Step 3: Loading SOTA Model...")
-        self.init_model()
-        
-        # Step 4: Initialize optimizer
-        logger.info("\n⚡ Step 4: Initializing Optimizer...")
-        self.init_optimizer()
-        
-        # Step 5: Preprocess datasets
-        logger.info("\n🔧 Step 5: SOTA Preprocessing...")
-        train_processed = self.preprocess_dataset(train_dataset)
-        
-        eval_processed = None
-        if eval_dataset:
-            eval_processed = self.preprocess_dataset(eval_dataset)
-        
-        # Step 6: Create data loaders
-        logger.info("\n📦 Step 6: Creating DataLoaders...")
-        train_dataloader = self.create_dataloader(train_processed, shuffle=True)
-        
-        eval_dataloader = None
-        if eval_processed:
-            eval_dataloader = self.create_dataloader(eval_processed, shuffle=False)
-        
-        # Step 7: Train
-        logger.info("\n🚂 Step 7: Training...")
-        metrics = self.train(train_dataloader, eval_dataloader)
-        
-        # Step 8: Export if enabled
-        export_cfg = self.config.export
-        if export_cfg.get("enabled", False):
-            logger.info("\n💾 Step 8: Exporting Model...")
-            self._export_model(export_cfg)
-            
-        # Step 9: Benchmark Inference
-        self.benchmark_inference()
-        
-        return {
-            "metrics": metrics,
-            "model": self._model,
-            "tokenizer": self._tokenizer,
-        }
-    
-    def _export_model(self, export_cfg: Dict[str, Any]):
-        """Export trained model."""
-        output_dir = export_cfg.get("output_dir", "./outputs/export")
+    def _export_model(self, trainer, output_dir: str):
+        """Export trained model with LoRA merging."""
+        log_rank_0(f"💾 Exporting model to {output_dir}...")
         os.makedirs(output_dir, exist_ok=True)
         
-        # Helper to unwrap model
-        def get_model(model):
-            return model.module if hasattr(model, "module") else model
+        # Unwrap model
+        model = trainer.model
+        if hasattr(model, "module"):
+            model = model.module
             
-        # Unwrap for processing
-        model_to_export = get_model(self._model)
-
-        # Merge LoRA if requested
-        if export_cfg.get("merge_lora", True):
-            logger.info("Merging LoRA weights (Internal)...")
+        # Merge LoRA logic
+        if self.config.export.merge_lora:
+            log_rank_0("Merging LoRA weights...")
             try:
-                # Use internal lora module to merge
+                # Use internal LoRA module
                 from data_pipeline.trainer import lora
-                model_to_export = lora.merge_and_unload(model_to_export)
+                model = lora.merge_and_unload(model)
+                log_rank_0("✓ Merged LoRA weights via internal module")
             except Exception as e:
-                logger.warning(f"Could not merge LoRA: {e}")
+                logger.warning(f"Merge failed: {e}")
         
         # Save
-        logger.info(f"Saving to {output_dir}")
-        model_to_export.save_pretrained(output_dir)
-        if self._tokenizer:
-            self._tokenizer.save_pretrained(output_dir)
+        model.save_pretrained(output_dir)
         
-        logger.info(f"Model exported to: {output_dir}")
-
-    def benchmark_inference(self, num_requests: int = 4):
-        """Benchmark SOTA Inference Engine."""
-        logger.info("\n🚀 Step 9: Benchmarking SOTA Inference...")
-        
-        # Load the exported (merged) model + tokenizer for fresh benchmark
-        export_dir = self.config.export.get("output_dir", "outputs/exported")
-        logger.info(f"Loading exported model from {export_dir} for benchmark...")
-        
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        
-        # Load fresh components to verify 'W + change weights' loading
-        inference_model = AutoModelForCausalLM.from_pretrained(
-            export_dir,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True
-        )
-        inference_tokenizer = AutoTokenizer.from_pretrained(export_dir)
-        
-        # Initialize Engine with fresh model
-        engine = inference.SOTAInferenceEngine(
-            model=inference_model, 
-            tokenizer=inference_tokenizer,
-            block_size=16
-        )
-        
-        # Add diverse prompts
-        # Add diverse prompts (formatted as chat)
-        prompts = [
-            [{"role": "user", "content": "Explain quantum computing in simple terms."}],
-            [{"role": "user", "content": "Write a python function to Fibonacci."}],
-            [{"role": "user", "content": "What is the capital of France?"}],
-            [{"role": "user", "content": "List 3 benefits of exercise."}],
-            [{"role": "user", "content": "Describe the future of AI."}]
-        ]
-        
-        # Add requests
-        for i in range(5):
-            messages = prompts[i % len(prompts)]
-            # Apply chat template
-            text_prompt = inference_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            engine.add_request(prompt=text_prompt, max_new_tokens=50)
+        # Save tokenizer from data pipeline
+        if self._data_pipeline._tokenizer_wrapper:
+            self._data_pipeline._tokenizer_wrapper.tokenizer.save_pretrained(output_dir)
             
-            # Run one standard generation for reference/sanity check
-            if i == 0:
-                logger.info("Running standard HF generation for sanity check...")
-                inputs = inference_tokenizer(text_prompt, return_tensors="pt").to(inference_model.device)
+        log_rank_0("Export complete.")
+
+    def _run_inference(self, model_path: str):
+        """Run sample inference on the exported model."""
+        log_rank_0(f"🚀 Running Inference Benchmark on {model_path}...")
+        
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
+            
+            # Load back for verification
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path, 
+                dtype=torch.bfloat16, 
+                device_map="cuda",
+                trust_remote_code=True
+            )
+            
+            prompts = [
+                "User: What is the capital of France?\nAssistant:",
+                "User: Write a python function to compute Fibonacci numbers.\nAssistant:",
+            ]
+            
+            for prompt in prompts:
+                log_rank_0(f"\nExample Prompt: {prompt}")
+                inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+                
                 with torch.no_grad():
-                    gen_tokens = inference_model.generate(
+                    outputs = model.generate(
                         **inputs, 
-                        max_new_tokens=50, 
-                        do_sample=False, 
-                        pad_token_id=inference_tokenizer.eos_token_id
+                        max_new_tokens=100, 
+                        do_sample=True, 
+                        temperature=0.7,
+                        pad_token_id=tokenizer.eos_token_id
                     )
-                logger.info(f"Standard Ref: {inference_tokenizer.decode(gen_tokens[0], skip_special_tokens=True)}")
+                
+                response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                log_rank_0(f"Response:\n{response}")
+                log_rank_0("-" * 40)
+                
+        except Exception as e:
+            log_rank_0(f"❌ Inference failed: {e}")
 
-        logger.info(f"Added 5 requests to Continuous Batching Scheduler.")
+    def run(self, max_steps: int = 100):
+        """Run the demo."""
+        log_rank_0("═" * 60)
+        log_rank_0("Starting SOTA DDP Training (using SOTATrainer)")
+        log_rank_0("═" * 60)
         
-        # Run Generation
-        responses = engine.generate_all()
+        # 1. Initialize Data Pipeline
+        log_rank_0("Initializing Data Pipeline...")
+        dp_result = DataPipeline.from_config(
+            self.config_path,
+            token=os.environ.get("HF_TOKEN"),
+            trust_remote_code=False,
+        )
+        self._data_pipeline = unwrap(dp_result)
         
-        for i, resp in enumerate(responses):
-            logger.info(f"Response {i}: {resp[:50]}...")
-
+        # 2. Create SOTA Trainer
+        log_rank_0("Initializing SOTA Trainer...")
+        trainer = create_trainer(self.config_path)
+        self.config = trainer.config # Cache config
+        
+        # Setup Model
+        log_rank_0("Setting up SOTA Model...")
+        trainer.setup_model()
+        
+        # Override config with CLI arguments
+        if max_steps > 0:
+            log_rank_0(f"Overriding max_steps: {max_steps}")
+            trainer.config.training.max_steps = max_steps
+        
+        # 3. Get Distributed DataLoader
+        batch_size = trainer.config.training.per_device_train_batch_size
+        
+        log_rank_0("Creating Distributed DataLoader...")
+        log_rank_0(f"DEBUG: train_split={trainer.config.data.train_split}")
+        dl_result = self._data_pipeline.get_dataloader(
+            split=trainer.config.data.train_split,
+            batch_size=batch_size,
+            distributed=(self.dist_state.world_size > 1),
+            rank=self.dist_state.rank,
+            world_size=self.dist_state.world_size,
+        )
+        dataloader = unwrap(dl_result)
+        
+        # Create Eval DataLoader
+        eval_dl_result = self._data_pipeline.get_dataloader(
+            split=trainer.config.data.eval_split,
+            batch_size=trainer.config.training.per_device_eval_batch_size,
+            distributed=(self.dist_state.world_size > 1),
+            rank=self.dist_state.rank,
+            world_size=self.dist_state.world_size,
+        )
+        eval_dataloader = unwrap(eval_dl_result)
+        
+        # 4. Train
+        log_rank_0("Starting Training Loop...")
+        metrics = trainer.train(dataloader, eval_dataloader=eval_dataloader)
+        
+        log_rank_0("Training Complete!")
+        log_rank_0(f"Final Metrics: {metrics}")
+        
+        # 5. Export & Inference (Rank 0 only)
+        if self.dist_state.rank == 0:
+            output_dir = trainer.config.training.output_dir
+            self._export_model(trainer, output_dir)
+            self._run_inference(output_dir)
+        
+        return metrics
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # Main Entry Point
 # ═════════════════════════════════════════════════════════════════════════════════
 
 def main():
-    """Main entry point for ROCm SOTA Demo."""
-    parser = argparse.ArgumentParser(
-        description="SOTA Training Demo for AMD ROCm MI300X Multi-GPU"
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="data_pipeline/examples/rocm_sota_config.yaml",
-        help="Path to YAML config file",
-    )
-    parser.add_argument(
-        "--gpus",
-        type=str,
-        default="2,3,4,5",
-        help="Comma-separated GPU IDs to use (middle 4 from 8)",
-    )
-    parser.add_argument(
-        "--distributed",
-        action="store_true",
-        help="Enable distributed multi-GPU training",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help="Just verify setup without training",
-    )
-    parser.add_argument(
-        "--max-samples",
-        type=int,
-        default=-1,
-        help="Limit number of dataset samples for debugging",
-    )
-    
+    parser = argparse.ArgumentParser(description="ROCm SOTA DDP Demo")
+    parser.add_argument("--config", type=str, default="rocm_sota_config.yaml", help="Path to YAML config")
+    parser.add_argument("--dry-run", action="store_true", help="Verify setup without training")
+    parser.add_argument("--max-steps", type=int, default=-1, help="Max training steps (default: -1, use YAML)")
     args = parser.parse_args()
     
-    # Parse GPU IDs
-    selected_gpus = [int(x) for x in args.gpus.split(",")]
-    
-    # Get ROCm GPU info
-    gpu_info = get_rocm_gpu_info()
-    
-    # Print banner
-    print_rocm_banner(gpu_info, selected_gpus)
-    
-    if not gpu_info["available"]:
-        logger.error("❌ No AMD GPUs detected! Please check ROCm installation.")
-        sys.exit(1)
-    
-    # Setup environment
-    setup_rocm_environment(selected_gpus)
-    
-    # Verify PyTorch can see GPUs
-    if torch.cuda.is_available():
-        logger.info(f"✅ PyTorch sees {torch.cuda.device_count()} GPU(s)")
-        for i in range(torch.cuda.device_count()):
-            props = torch.cuda.get_device_properties(i)
-            mem_gb = props.total_memory / 1e9
-            logger.info(f"   GPU {i}: {props.name} ({mem_gb:.1f} GB)")
-    else:
-        logger.error("❌ PyTorch cannot see CUDA GPUs!")
-        sys.exit(1)
+    # 1. Environment Setup
+    # Ensure variables are set for DDP
+    if "RANK" not in os.environ:
+        os.environ["RANK"] = "0"
+        os.environ["LOCAL_RANK"] = "0"
+        os.environ["WORLD_SIZE"] = "1"
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = "29500"
     
     if args.dry_run:
-        logger.info("\n✅ Dry run complete! Setup verified.")
+        print("Dry run successful. Environment verified.")
         return
-    
-    # Load config
-    logger.info(f"\n📄 Loading config: {args.config}")
-    config = SOTARocmConfig.from_yaml(args.config)
-    
-    # Print config summary
-    print("\n" + "─" * 60)
-    print("📋 Configuration Summary:")
-    print("─" * 60)
-    print(f"   Model: {config.get_model_name()}")
-    print(f"   Dataset: {config.get_dataset_name()}")
-    print(f"   Training Mode: {config.training_mode}")
-    print(f"   Optimizer: {config.optimizer.get('type', 'adamw')}")
-    print(f"   Scheduler: {config.scheduler.get('type', 'cosine')}")
-    print(f"   LoRA Rank: {config.lora.get('r', 64)}")
-    print(f"   Max Length: {config.get_max_length()}")
-    print(f"   Batch Size: {config.get_batch_size()}")
-    print("─" * 60 + "\n")
-    
-    # Create and run pipeline
-    if args.max_samples > 0:
-        config.max_samples = args.max_samples # Inject into config
-        
-    pipeline = SOTARocmPipeline(config, selected_gpus)
-    results = pipeline.run()
-    
-    # Final summary
-    print("\n" + "═" * 60)
-    print("🎉 SOTA Training Complete!")
-    print("═" * 60)
-    print(f"   Final Loss: {results['metrics']['train_loss']:.4f}")
-    print(f"   Total Steps: {results['metrics']['total_steps']}")
-    print(f"   Training Time: {results['metrics']['training_time_hours']:.2f} hours")
-    print("═" * 60)
 
+    # 2. Run Demo
+    try:
+        demo = SOTADemo(args.config)
+        demo.run(max_steps=args.max_steps)
+        
+        # Cleanup
+        if dist.is_initialized():
+            dist.destroy_process_group()
+            
+    except Exception as e:
+        # Log error cleanly
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()

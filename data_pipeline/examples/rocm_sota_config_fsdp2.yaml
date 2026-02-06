@@ -1,0 +1,209 @@
+# ════════════════════════════════════════════════════════════════════════════════
+# SOTA Training Configuration - FSDP2 - AMD ROCm MI300X
+# ════════════════════════════════════════════════════════════════════════════════
+# Fully Sharded Data Parallel (FSDP2) configuration for max scale/performance.
+#
+# Hardware: AMD Instinct MI300X (192GB HBM3)
+# Strategy: FSDP2 (Full Shard, BF16, Triton-Fused Kernels)
+# ════════════════════════════════════════════════════════════════════════════════
+
+config_version: "2.0"
+config_type: "sota_training"
+
+# DataPipeline Requirements
+type: "data_module"
+version: "1.0"
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Training Mode
+# ═════════════════════════════════════════════════════════════════════════════════
+training_mode: "full"  # Full Fine-Tuning with FSDP2
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Model Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+model:
+  name_or_path: "mistralai/Mistral-7B-Instruct-v0.3"
+  revision: "main"
+  trust_remote_code: true
+  torch_dtype: "bfloat16"
+  low_cpu_mem_usage: true
+  use_flash_attention_2: false       # Set false to use internal SOTA kernels handling
+  attn_implementation: "sdpa"        # SOTA for ROCm
+  max_position_embeddings: null
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Tokenizer Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+tokenizer:
+  name_or_path: "mistralai/Mistral-7B-Instruct-v0.3"
+  use_fast: true
+  padding_side: "right"
+  truncation_side: "right"
+  max_length: 4096
+  add_eos_token: true
+  add_pad_token: true
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Dataset Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+dataset:
+  name: "HuggingFaceH4/ultrachat_200k"
+  splits:
+    train:
+      name: "train_sft"
+      sample_size: 10000
+      shuffle: true
+      seed: 42
+    validation:
+      name: "test_sft"
+      sample_size: 1000
+      shuffle: false
+  column_mapping:
+    messages: "messages"
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Prompt Template
+# ═════════════════════════════════════════════════════════════════════════════════
+prompt_template:
+  format_type: "chat"
+  system_message: "You are a helpful, respectful and honest AI assistant."
+  input_columns: ["messages"]
+  mask_input: true
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Output Schema
+# ═════════════════════════════════════════════════════════════════════════════════
+output_schema:
+  input_ids: {dtype: "long", pad_value: null}
+  attention_mask: {dtype: "long", pad_value: 0}
+  labels: {dtype: "long", pad_value: -100}
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Preprocessing
+# ═════════════════════════════════════════════════════════════════════════════════
+preprocessing:
+  length_manager:
+    enabled: true
+    max_total_length: 4096
+    padding_strategy: "longest"
+    truncation_strategy: "smart"
+  packing:
+    enabled: true
+    efficiency_threshold: 0.95
+    max_sequences_per_pack: 8
+    add_position_ids: true
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# DataLoader
+# ═════════════════════════════════════════════════════════════════════════════════
+dataloader:
+  batch_size: 8
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 2
+  persistent_workers: true
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Distributed Configuration - FSDP2 ENABLED
+# ═════════════════════════════════════════════════════════════════════════════════
+distributed:
+  enabled: true
+  backend: "nccl"
+  strategy: "fsdp2"          # <--- ENABLE SOTA FSDP2
+  world_size: 4
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false
+  
+  # FSDP2 Specific Config (SOTA Level)
+  fsdp_config:
+    sharding_strategy: "full_shard"      # Max memory saving (Zero-3 equivalent)
+    mixed_precision: "bf16"              # Native BF16 for MI300X
+    activation_checkpointing: true
+    use_triton_kernels: true             # <--- SOTA Triton Fused Op
+    forward_prefetch: true               # Overlap communication/compute
+    limit_all_gathers: true              # Memory stability
+    use_orig_params: true                # Required for compile/optim compatibility
+    gradient_accumulation_steps: 4
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Hardware Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+hardware:
+  device: "cuda"
+  device_id: 0
+  precision: "bf16"
+  compile_model: false       # Keep false for initial stability
+  num_workers: 4
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Kernel Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+kernels:
+  use_triton: true           # Enable all TRITON kernels
+  use_flash_attention: true
+  use_fused_rope: true
+  use_fused_rms_norm: true
+  use_fused_cross_entropy: true
+  use_fused_lora: true
+  autotune: true
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Data Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+data:
+  dataset_name: "HuggingFaceH4/ultrachat_200k"
+  dataset_config: null
+  streaming: false
+  max_samples: 10000        # 10K samples for demo
+  train_split: "train_sft"
+  eval_split: "test_sft"
+  text_column: "messages"
+  max_seq_length: 4096
+  packing: true
+  packing_efficiency: 0.95
+  shuffle: true
+  seed: 42
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Training Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+training:
+  output_dir: "./outputs/rocm_sota_fsdp2_run"
+  num_train_epochs: 1
+  per_device_train_batch_size: 32  # High batch size for VRAM util
+  per_device_eval_batch_size: 8
+  gradient_accumulation_steps: 4
+  eval_strategy: "steps"
+  eval_steps: 5
+  save_strategy: "steps"
+  save_steps: 5
+  logging_steps: 1
+  seed: 42
+  max_steps: 5               # Short run for verification
+  
+# ═════════════════════════════════════════════════════════════════════════════════
+# Optimizer & Scheduler
+# ═════════════════════════════════════════════════════════════════════════════════
+optimizer:
+  type: "adamw"
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+scheduler:
+  type: "wsd"
+  warmup_steps: 5
+  min_lr_ratio: 0.1
+
+lora:
+  enabled: false # Disabled for Full FT FSDP2
+
+quantization:
+  enabled: false
+
+export:
+  enabled: true
+  output_dir: "./outputs/rocm_sota_fsdp2_export"
+  format: "safetensors"
+  push_to_hub: false

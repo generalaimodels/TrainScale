@@ -247,7 +247,7 @@ def detect_hardware(device_id: int = 0) -> Result[HardwareInfo]:
         total_memory_bytes=props.total_memory,
         num_sms=props.multi_processor_count,
         max_threads_per_sm=props.max_threads_per_multi_processor,
-        l2_cache_bytes=props.l2_cache_size,
+        l2_cache_bytes=getattr(props, "l2_cache_size", getattr(props, "L2_cache_size", 4 * 1024 * 1024)),
         supports_nvlink=has_nvlink,
         pcie_bandwidth_gbps=32.0 if props.major >= 8 else 16.0,  # PCIe 4/5 estimate
     ))

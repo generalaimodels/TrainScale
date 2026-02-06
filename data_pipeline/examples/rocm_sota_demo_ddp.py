@@ -297,6 +297,7 @@ class SOTADemo:
         batch_size = trainer.config.training.per_device_train_batch_size
         
         log_rank_0("Creating Distributed DataLoader...")
+        log_rank_0(f"DEBUG: train_split={trainer.config.data.train_split}")
         dl_result = self._data_pipeline.get_dataloader(
             split=trainer.config.data.train_split,
             batch_size=batch_size,
