@@ -152,13 +152,20 @@ class PreprocessedDataset(Dataset):
         
         return result
     
-    def _to_tensors(self, processed: ProcessedExample) -> Dict[str, torch.Tensor]:
-        """Convert ProcessedExample to tensor dict."""
-        return {
-            "input_ids": torch.tensor(processed.input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(processed.attention_mask, dtype=torch.long),
-            "labels": torch.tensor(processed.labels, dtype=torch.long),
-        }
+    def _to_tensors(self, processed: Any) -> Dict[str, torch.Tensor]:
+        """Convert ProcessedExample (or RL variants) to tensor dict."""
+        import dataclasses
+        out = {}
+        # Use asdict to get all fields, supporting ProcessedExample, PreferencePairExample, etc.
+        data = dataclasses.asdict(processed)
+        for k, v in data.items():
+            # Convert list of ints to LongTensor
+            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], int):
+                out[k] = torch.tensor(v, dtype=torch.long)
+            # Handle empty lists if key implies tensor or always return valid tensor for known keys
+            elif k in ("input_ids", "attention_mask", "labels") and isinstance(v, list):
+                 out[k] = torch.tensor(v, dtype=torch.long)
+        return out
     
     def clear_cache(self) -> None:
         """Clear the preprocessed example cache."""

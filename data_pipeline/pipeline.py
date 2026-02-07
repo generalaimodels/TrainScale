@@ -59,6 +59,10 @@ from data_pipeline.data.dataset_wrappers import (
     StreamingPreprocessedDataset,
     create_preprocessed_dataset,
 )
+from data_pipeline.preprocessing.length_manager import (
+    TokenAwareContentDistributor,
+    ContentDistributionMode,
+)
 from data_pipeline.data.dataloader_factory import (
     build_dataloader,
     DataLoaderBuilder,
@@ -255,12 +259,29 @@ class DataPipeline:
         
         tokenizer = unwrap(tokenizer_result)
         
-        # Use configured template or create default
-        template = self._config.prompt_template or PromptTemplate()
+        tokenizer = unwrap(tokenizer_result)
+        
+        # Initialize TokenAwareContentDistributor
+        # Derived from PromptEngineConfig
+        pe_config = self._config.prompt_engine
+        
+        distributor = TokenAwareContentDistributor(
+            total_max_tokens=pe_config.max_length,
+            # We default to PROPORTIONAL for now, could be exposed in config later
+            distribution_mode=ContentDistributionMode.PROPORTIONAL,
+            default_truncation=pe_config.truncation_strategy,
+            tokenizer=tokenizer,
+        )
+        
+        # Use configured template via config (legacy 'prompt_template' field is handled in PromptEngine.from_legacy if needed,
+        # but here we use the primary constructor with the full config).
+        # Note: If self._config.prompt_template is set (legacy), we might want to sync it, 
+        # but PromptEngineConfig should be the source of truth.
         
         self._prompt_engine = PromptEngine(
-            template=template,
+            config=pe_config,
             tokenizer=tokenizer,
+            distributor=distributor,
         )
         
         return Ok(self._prompt_engine)
@@ -420,6 +441,10 @@ class DataPipeline:
         # Build DataLoader
         dl_config = self._config.dataloader or DataLoaderConfig()
         
+        # Custom configs from kwargs or defaults
+        pin_memory = kwargs.pop("pin_memory", dl_config.pin_memory)
+        drop_last = kwargs.pop("drop_last", dl_config.drop_last)
+        
         try:
             # Get tokenizer for padding config
             tokenizer_result = self._ensure_tokenizer()
@@ -432,8 +457,8 @@ class DataPipeline:
                 batch_size=batch_size or dl_config.batch_size,
                 shuffle=shuffle if shuffle is not None else dl_config.shuffle,
                 num_workers=num_workers or dl_config.num_workers,
-                pin_memory=dl_config.pin_memory,
-                drop_last=dl_config.drop_last,
+                pin_memory=pin_memory,
+                drop_last=drop_last,
                 pad_token_id=pad_token_id,
                 output_schema=self._config.output_schema,
                 distributed=distributed,

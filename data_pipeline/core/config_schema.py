@@ -19,6 +19,7 @@ from typing import (
     Tuple,
     Union,
 )
+from enum import Enum, auto
 
 import yaml
 
@@ -42,6 +43,65 @@ PROMPT_FORMAT_TYPES = frozenset({"chat", "completion", "custom"})
 
 # Valid tensor dtypes
 TENSOR_DTYPES = frozenset({"long", "int", "float", "half", "bfloat16", "bool"})
+
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Enums
+# ─────────────────────────────────────────────────────────────────────────────────
+
+class TrainingStage(Enum):
+    PRE_TRAINING = auto()
+    FINE_TUNING = auto()
+    POST_TRAINING_RL = auto()
+
+class PreTrainingFormat(Enum):
+    CAUSAL_LM = auto()
+    FIM = auto()
+    SPAN_CORRUPTION = auto()
+
+class FineTuningFormat(Enum):
+    CHAT = auto()
+    COMPLETION = auto()
+    INSTRUCTION = auto()
+    CUSTOM = auto()
+
+class RLAlgorithm(Enum):
+    DPO = auto()
+    PPO = auto()
+    KTO = auto()
+    ORPO = auto()
+    GRPO = auto()
+    REWARD_MODEL = auto()
+
+class FIMMode(Enum):
+    PSM = auto()  # Prefix-Suffix-Middle
+    SPM = auto()  # Suffix-Prefix-Middle
+
+class PackingStrategy(Enum):
+    GREEDY = auto()   # Pack until context length (was FULL)
+    SINGLE = auto()   # One document per sequence (pad rest)
+
+class TruncationStrategy(Enum):
+    NONE = auto()
+    SIMPLE = auto()
+    WORD_BOUNDARY = auto()
+    SENTENCE_BOUNDARY = auto()
+    CLAUSE_BOUNDARY = auto()
+    SMART = auto()
+
+class ContentDistributionMode(Enum):
+    EQUAL = auto()
+    PROPORTIONAL = auto()
+    RATIO = auto()
+    PRIORITY = auto()
+    ADAPTIVE = auto()
+
+class PaddingStrategy(Enum):
+    DO_NOT_PAD = auto()
+    LONGEST = auto()
+    MAX_LENGTH = auto()
+    BUCKET = auto()
+    POWER_OF_TWO = auto()
 
 
 # ─────────────────────────────────────────────────────────────────────────────────
@@ -284,6 +344,109 @@ class PromptTemplate:
 
 
 # ─────────────────────────────────────────────────────────────────────────────────
+# Prompt Engine Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class FIMConfig:
+    enabled: bool = False
+    rate: float = 0.5
+    mode: FIMMode = FIMMode.PSM
+    spm_rate: float = 0.5
+    seed: int = 42
+
+@dataclass(frozen=True, slots=True)
+class PackingConfig:
+    strategy: PackingStrategy = PackingStrategy.GREEDY
+    use_vsl: bool = False  # Variable Sequence Length (unpadding)
+
+@dataclass(frozen=True, slots=True)
+class SpanCorruptionConfig:
+    enabled: bool = False
+    noise_density: float = 0.15
+    mean_noise_span_length: float = 3.0
+
+@dataclass(frozen=True, slots=True)
+class PreTrainingConfig:
+    format: PreTrainingFormat = PreTrainingFormat.CAUSAL_LM
+    fim: FIMConfig = field(default_factory=FIMConfig)
+    packing: PackingConfig = field(default_factory=PackingConfig)
+    span_corruption: SpanCorruptionConfig = field(default_factory=SpanCorruptionConfig)
+    
+    # Data columns
+    text_column: str = "text"
+    
+    # Tokenization settings
+    add_bos: bool = True
+    add_eos: bool = True
+
+@dataclass(frozen=True, slots=True)
+class MultiTurnConfig:
+    enabled: bool = True
+    max_turns: Optional[int] = None
+    mask_user_turns: bool = True  # Only train on assistant turns
+
+@dataclass(frozen=True, slots=True)
+class FineTuningConfig:
+    format: FineTuningFormat = FineTuningFormat.CHAT
+    multiturn: MultiTurnConfig = field(default_factory=MultiTurnConfig)
+    train_on_inputs: bool = False
+    
+    # Instruction format settings
+    instruction_column: str = "instruction"
+    input_column: str = "input"
+    output_column: str = "output"
+    
+    # General generation settings
+    mask_input: bool = True
+    add_eos: bool = True
+
+@dataclass(frozen=True, slots=True)
+class RLColumnMapping:
+    chosen: str = "chosen"
+    rejected: str = "rejected"
+    prompt: str = "prompt"
+    response: str = "response"
+    label: str = "label"       # For KTO (bool)
+    weight: str = "weight"     # For KTO (float)
+    reward: str = "reward"     # For numeric rewards
+
+@dataclass(frozen=True, slots=True)
+class RLConfig:
+    algorithm: RLAlgorithm = RLAlgorithm.DPO
+    mapping: RLColumnMapping = field(default_factory=RLColumnMapping)
+    beta: float = 0.1
+    max_prompt_length: Optional[int] = None
+    max_completion_length: Optional[int] = None
+    
+    # Generation settings
+    mask_prompt: bool = True
+    system_message: Optional[str] = None
+    add_bos: bool = True
+    add_eos: bool = True
+
+@dataclass(frozen=True, slots=True)
+class PromptEngineConfig:
+    """
+    Unified configuration for all training stages.
+    """
+    stage: TrainingStage = TrainingStage.FINE_TUNING
+    max_length: int = 2048
+    # Stage-specific sub-configs.
+    pretraining: PreTrainingConfig = field(default_factory=PreTrainingConfig)
+    finetuning: FineTuningConfig = field(default_factory=FineTuningConfig)
+    rl: RLConfig = field(default_factory=RLConfig)
+    # Legacy compatibility — forwarded to fine-tuning if present.
+    template: Optional[PromptTemplate] = None
+    # Column mapping override (src → dst).
+    column_mapping: Dict[str, str] = field(default_factory=dict)
+    # Per-column character limits (legacy LengthManager integration).
+    per_column_limits: Dict[str, int] = field(default_factory=dict)
+    # Truncation default.
+    truncation_strategy: TruncationStrategy = TruncationStrategy.SMART
+
+
+# ─────────────────────────────────────────────────────────────────────────────────
 # Output Tensor Schema (Loss Alignment)
 # ─────────────────────────────────────────────────────────────────────────────────
 
@@ -393,7 +556,9 @@ class PipelineConfig:
     version: str
     dataset: DatasetConfig
     tokenizer: TokenizerConfig
-    prompt_template: PromptTemplate
+    prompt_engine: PromptEngineConfig = field(default_factory=PromptEngineConfig)
+    # Legacy field - kept for backward compatibility but mapped to proper PromptEngineConfig
+    prompt_template: Optional[PromptTemplate] = None
     output_schema: OutputSchema = field(default_factory=OutputSchema)
     dataloader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
     
@@ -480,6 +645,34 @@ def _parse_tokenizer_config(data: Dict[str, Any]) -> TokenizerConfig:
         truncation_side=data.get("truncation_side", "right"),
         special_tokens=data.get("special_tokens", {}),
         add_special_tokens=data.get("add_special_tokens", True),
+    )
+
+
+def _parse_prompt_engine_config(data: Dict[str, Any]) -> PromptEngineConfig:
+    """Parse PromptEngineConfig from dict."""
+    stage_str = data.get("stage", "FINE_TUNING").upper()
+    try:
+        stage = TrainingStage[stage_str]
+    except KeyError:
+        stage = TrainingStage.FINE_TUNING
+
+    # Parse sub-configs (simplified for now, ideally full recursive parsing)
+    # In a full implementation, we'd have _parse_pretraining_config, etc.
+    # For now, we assume dicts are structured correctly or rely on default_factory
+    
+    trunc_str = data.get("truncation_strategy", "SMART").upper()
+    try:
+        trunc_strat = TruncationStrategy[trunc_str]
+    except KeyError:
+        trunc_strat = TruncationStrategy.SMART
+
+    return PromptEngineConfig(
+        stage=stage,
+        max_length=data.get("max_length", 2048),
+        column_mapping=data.get("column_mapping", {}),
+        per_column_limits=data.get("per_column_limits", {}),
+        truncation_strategy=trunc_strat,
+        # TODO: Add recursive parsing for sub-configs if needed for strict validation
     )
 
 
@@ -582,7 +775,9 @@ def load_config(path: Union[str, Path]) -> Result[PipelineConfig, ConfigurationE
         ))
     
     # Validate required top-level keys
-    required_keys = {"type", "version", "dataset", "tokenizer", "prompt_template"}
+    required_keys = {"type", "version", "dataset", "tokenizer"}
+    # prompt_template is now optional if prompt_engine is present, or for legacy support
+
     missing = required_keys - set(data.keys())
     if missing:
         return Err(SchemaValidationError(
@@ -597,7 +792,8 @@ def load_config(path: Union[str, Path]) -> Result[PipelineConfig, ConfigurationE
             version=data["version"],
             dataset=_parse_dataset_config(data["dataset"]),
             tokenizer=_parse_tokenizer_config(data["tokenizer"]),
-            prompt_template=_parse_prompt_template(data["prompt_template"]),
+            prompt_engine=_parse_prompt_engine_config(data.get("prompt_engine", {})),
+            prompt_template=_parse_prompt_template(data.get("prompt_template", {})),
             output_schema=_parse_output_schema(data.get("output_schema", {})),
             dataloader=_parse_dataloader_config(data.get("dataloader", {})),
         )

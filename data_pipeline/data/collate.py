@@ -155,6 +155,93 @@ def pad_sequence_left(
 # Collate Function Factory
 # ─────────────────────────────────────────────────────────────────────────────────
 
+class CollateFn:
+    """
+    Pickleable collate function object.
+    
+    Replaces closure-based implementation to support Windows multiprocessing.
+    """
+    def __init__(
+        self,
+        pad_token_id: int,
+        label_pad_token_id: int,
+        padding_side: Literal["left", "right"],
+        max_length: Optional[int],
+        output_schema: Optional[OutputSchema],
+        label_dtype: torch.dtype,
+    ):
+        self.pad_token_id = pad_token_id
+        self.label_pad_token_id = label_pad_token_id
+        self.padding_side = padding_side
+        self.max_length = max_length
+        self.output_schema = output_schema
+        self.label_dtype = label_dtype
+        self.pad_fn = pad_sequence_left if padding_side == "left" else pad_sequence_right
+
+    def __call__(self, batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
+        """
+        Collate batch of examples into padded tensors.
+        
+        Dynamically handles all tensor keys in the batch, applying appropriate
+        padding values based on key suffixes (e.g. *_input_ids -> pad_token_id).
+        """
+        if not batch:
+            return {}
+        
+        result = {}
+        keys = batch[0].keys()
+        
+        for key in keys:
+            values = [ex[key] for ex in batch]
+            
+            if not values:
+                result[key] = []
+                continue
+                
+            if isinstance(values[0], Tensor):
+                # Determine padding value
+                if key.endswith("input_ids"):
+                    pad_val = self.pad_token_id
+                elif key.endswith("labels"):
+                    pad_val = self.label_pad_token_id
+                elif key.endswith("attention_mask"):
+                    pad_val = 0
+                elif self.output_schema and key in self.output_schema.extras:
+                    pad_val = self.output_schema.extras[key].pad_value or 0
+                else:
+                    pad_val = 0
+                
+                # Pad sequence
+                padded = self.pad_fn(values, pad_val, self.max_length)
+                
+                # Apply label masking if applicable
+                # For standard 'labels', mask where attention_mask is 0
+                if key == "labels" and "attention_mask" in result:
+                    padded = padded.masked_fill(result["attention_mask"] == 0, self.label_pad_token_id)
+                elif key.endswith("_labels"):
+                    # Try to find corresponding mask (e.g. chosen_labels -> chosen_attention_mask)
+                    prefix = key[:-7] # remove _labels
+                    mask_key = prefix + "_attention_mask"
+                    # We can't guarantee mask_key is processed yet or exists
+                    # So we might need to do a second pass or just rely on raw padding
+                    # For now, let's just pad. Masking should be handled by model or pre-masking.
+                    pass
+                
+                # Cast labels to correct dtype
+                if key.endswith("labels"):
+                    padded = padded.to(self.label_dtype)
+                
+                result[key] = padded
+            else:
+                 # Non-tensor values
+                result[key] = values
+
+        # Post-processing for standard label masking if attention_mask was processed after labels
+        if "labels" in result and "attention_mask" in result:
+             result["labels"] = result["labels"].masked_fill(result["attention_mask"] == 0, self.label_pad_token_id)
+
+        return result
+
 def create_collate_fn(
     pad_token_id: int = DEFAULT_PAD_TOKEN_ID,
     label_pad_token_id: int = DEFAULT_LABEL_PAD_ID,
@@ -190,67 +277,19 @@ def create_collate_fn(
     Returns:
         Collate function for use with DataLoader
     """
-    # Select padding function
-    pad_fn = pad_sequence_left if padding_side == "left" else pad_sequence_right
-    
     # Get dtype for labels from schema if provided
     label_dtype = torch.long
     if output_schema and output_schema.labels:
         label_dtype = DTYPE_MAP.get(output_schema.labels.dtype, torch.long)
     
-    def collate_fn(batch: List[Dict[str, Tensor]]) -> Dict[str, Tensor]:
-        """
-        Collate batch of examples into padded tensors.
-        
-        Args:
-            batch: List of dicts with input_ids, attention_mask, labels
-            
-        Returns:
-            Dict with batched and padded tensors
-        """
-        if not batch:
-            return {}
-        
-        # Extract sequences
-        input_ids_list = [ex["input_ids"] for ex in batch]
-        attention_mask_list = [ex["attention_mask"] for ex in batch]
-        labels_list = [ex["labels"] for ex in batch]
-        
-        # Pad sequences
-        input_ids = pad_fn(input_ids_list, pad_token_id, max_length)
-        attention_mask = pad_fn(attention_mask_list, 0, max_length)
-        labels = pad_fn(labels_list, label_pad_token_id, max_length)
-        
-        # Ensure labels are properly masked for padding
-        # Where attention_mask is 0, labels should be -100
-        labels = labels.masked_fill(attention_mask == 0, label_pad_token_id)
-        
-        # Cast to expected dtype
-        labels = labels.to(label_dtype)
-        
-        result = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": labels,
-        }
-        
-        # Handle any extra keys in batch
-        extra_keys = set(batch[0].keys()) - {"input_ids", "attention_mask", "labels"}
-        for key in extra_keys:
-            values = [ex[key] for ex in batch]
-            if isinstance(values[0], Tensor):
-                # Determine padding value for this key
-                pad_val = 0  # Default
-                if output_schema and key in output_schema.extras:
-                    pad_val = output_schema.extras[key].pad_value or 0
-                result[key] = pad_fn(values, pad_val, max_length)
-            else:
-                # Non-tensor values, just list them
-                result[key] = values
-        
-        return result
-    
-    return collate_fn
+    return CollateFn(
+        pad_token_id=pad_token_id,
+        label_pad_token_id=label_pad_token_id,
+        padding_side=padding_side,
+        max_length=max_length,
+        output_schema=output_schema,
+        label_dtype=label_dtype,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────────
