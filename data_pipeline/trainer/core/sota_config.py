@@ -307,6 +307,10 @@ class DistributedConfig:
     fsdp_config: Dict[str, Any] = field(default_factory=dict)
     ddp_config: Dict[str, Any] = field(default_factory=dict)
     deepspeed_config: Optional[str] = None
+    # Pipeline Parallelism (ZBPP)
+    num_pipeline_stages: int = 4
+    num_microbatches: int = 8
+    pipeline_memory_limit_gb: float = 4.0
 
 
 @dataclass

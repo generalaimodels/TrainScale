@@ -229,6 +229,25 @@ class SOTATrainer:
             # (prepare_optimizer will be called later if needed by user, 
             # but standard construction might need awareness)
         
+        elif self.distributed_strategy == "pipeline_zbpp":
+            logger.info("Applying SOTA ZBPP Pipeline wrapper...")
+            from data_pipeline.trainer.distributed.zbpp import create_zbpp_pipeline
+            
+            # ZBPP handles partitioning and optimization
+            self.model = create_zbpp_pipeline(
+                model=self.model,
+                num_stages=self.config.distributed.num_pipeline_stages,
+                num_microbatches=self.config.distributed.num_microbatches,
+                memory_limit_gb=self.config.distributed.pipeline_memory_limit_gb,
+                lr=self.config.optimizer.learning_rate,
+                weight_decay=self.config.optimizer.weight_decay,
+                dtype=self.dtype,
+                rank=dist.get_rank() if dist.is_initialized() else 0,
+                world_size=dist.get_world_size() if dist.is_initialized() else 1,
+            )
+            # ZBPP manages its own optimizer
+            self.optimizer = self.model._optimizer
+        
         # Compile if enabled (and compatible)
         if self.config.hardware.compile_model:
             # Note: FSDP + torch.compile requires use_orig_params=True
@@ -601,11 +620,53 @@ class SOTATrainer:
                     # Move batch to device
                     batch = {k: v.to(self.device) if isinstance(v, Tensor) else v for k, v in batch.items()}
                     
-                    outputs = self.model(
+                    if self.distributed_strategy == "pipeline_zbpp":
+                         # ZBPP expects list of microbatches, but our dataloader yields global batches
+                         # create_zbpp_pipeline setup expects us to pass inputs to train_step?
+                         # Wait, SOTATrainer.train calls self.model(inputs)
+                         # self.model is ZeroBubblePipeline
+                         # ZeroBubblePipeline.train_step signature: (micro_batches, labels, loss_fn)
+                         # We need to reshape batch into microbatches here?
+                         # Or ZeroBubblePipeline should handle it? 
+                         # ZBPP implementation expects list of tensors.
+                         
+                         # Splitting batch into microbatches
+                         num_mb = self.config.distributed.num_microbatches
+                         mb_size = batch["input_ids"].size(0) // num_mb
+                         
+                         micro_inputs = list(batch["input_ids"].split(mb_size))
+                         micro_labels = list(batch["labels"].split(mb_size))
+                         
+                         outputs = self.model.train_step(
+                             micro_batches=micro_inputs,
+                             labels=micro_labels,
+                             loss_fn=self.loss_fn
+                         )
+                    else:
+                        outputs = self.model(
                         input_ids=batch["input_ids"],
                         attention_mask=batch.get("attention_mask"),
                         labels=batch.get("labels"),
                     )
+                    
+                    # ZBPP Special Handling
+                    if self.distributed_strategy == "pipeline_zbpp":
+                        # ZBPP returns dict with metrics, handled inside train_step
+                        # It performs backward and optimizer step internally
+                        loss = outputs["loss"]
+                        # Metrics mapping
+                        loss_tracker.update(loss, num_tokens=1) # accumulation handled inside
+                        # Skip standard backward/optimizer logic
+                        
+                        # Log if needed
+                        if self.state.global_step % 10 == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
+                            pass
+                        
+                        if self.scheduler:
+                            self.scheduler.step()
+                            
+                        self.state.global_step += 1
+                        continue  # Skip to next batch
                     
                     if hasattr(outputs, "loss") and outputs.loss is not None:
                         loss = outputs.loss

@@ -1137,3 +1137,15 @@ from .sota_utils import (
     save_checkpoint_distributed,
     load_checkpoint_distributed,
 )
+
+try:
+    from .zbpp import (
+        ZeroBubblePipeline,
+        ZBPPRuntimeEngine,
+        ZBPPOptimizer,
+        ScheduleConfig,
+        create_zbpp_pipeline,
+    )
+except ImportError:
+    pass
+

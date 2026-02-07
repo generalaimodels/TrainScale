@@ -132,7 +132,17 @@ class TrainingConfig:
     report_to: str = "tensorboard"
     push_to_hub: bool = False
     hub_model_id: Optional[str] = None
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Distributed Settings (DDP, FSDP, Pipeline)
+    # ─────────────────────────────────────────────────────────────────────────
     
+    distributed_strategy: str = "ddp"  # ddp, fsdp2, pipeline_zbpp
+    
+    # Pipeline Parallelism
+    num_pipeline_stages: int = 4
+    num_microbatches: int = 8
+    pipeline_memory_limit_gb: float = 4.0
     # ─────────────────────────────────────────────────────────────────────────
     # Seed
     # ─────────────────────────────────────────────────────────────────────────

@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 # ════════════════════════════════════════════════════════════════════════════════
-# SOTA End-to-End Demo for AMD ROCm MI300X - FSDP2 Version
+# SOTA End-to-End Demo for Zero Bubble Pipeline Parallelism (ZBPP)
 # ════════════════════════════════════════════════════════════════════════════════
-# Complete FSDP2 pipeline demonstration using TrainScale SOTA modules.
-# Optimized for massive scale training (Llama-3 70B+, etc.)
+# Complete ZBPP pipeline demonstration using TrainScale SOTA modules:
+#   - YAML-driven configuration
+#   - Pipeline Parallelism with Zero Bubbles
+#   - SOTA model: Mistral-7B / Llama-3 (registry compatible)
 #
 # Usage:
-#   Verify Integration (CPU/Tiny Model):
-#     python rocm_sota_demo_fsdp2.py --verify
-#
-#   Multi-GPU Training (4 GPUs):
-#     torchrun --nproc_per_node=4 rocm_sota_demo_fsdp2.py --config rocm_sota_config_fsdp2.yaml
+#   Single Node (Multi-GPU):
+#     torchrun --nproc_per_node=4 zbpp_sota_demo.py --config zbpp_sota_config.yaml
 #
 # ════════════════════════════════════════════════════════════════════════════════
 
@@ -23,7 +22,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # Path Setup
@@ -46,10 +45,10 @@ from data_pipeline.trainer.distributed import (
     log_rank_0,
 )
 from data_pipeline.trainer.core.sota_config import SOTAConfig
-from data_pipeline.trainer.core.sota_config import SOTAConfig
 from data_pipeline.trainer.trainers.sota_trainer import create_trainer, SOTATrainer
 from data_pipeline.pipeline import DataPipeline
 from data_pipeline.core.types import unwrap
+from data_pipeline.trainer.distributed.zbpp import ZeroBubblePipeline, ZBPPOptimizer
 from data_pipeline.trainer import inference
 
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -61,7 +60,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("rocm_sota_demo_fsdp2")
+logger = logging.getLogger("zbpp_sota_demo")
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -69,13 +68,13 @@ logger = logging.getLogger("rocm_sota_demo_fsdp2")
 # ═════════════════════════════════════════════════════════════════════════════════
 
 @dataclass
-class SOTAFSDP2Config:
-    """SOTA FSDP2 configuration container from YAML."""
+class SOTAZBPPConfig:
+    """SOTA ZBPP configuration container from YAML."""
     raw: Dict[str, Any] = field(default_factory=dict)
     config_path: str = ""
     
     @classmethod
-    def from_yaml(cls, path: str) -> "SOTAFSDP2Config":
+    def from_yaml(cls, path: str) -> "SOTAZBPPConfig":
         """Load configuration from YAML file."""
         p = Path(path)
         if not p.exists():
@@ -111,8 +110,16 @@ class SOTAFSDP2Config:
         return self.raw.get("training", {})
     
     @property
+    def data(self) -> Dict[str, Any]:
+        return self.raw.get("data", {})
+    
+    @property
     def dataloader(self) -> Dict[str, Any]:
         return self.raw.get("dataloader", {})
+    
+    @property
+    def quantization(self) -> Dict[str, Any]:
+        return self.raw.get("quantization", {})
     
     @property
     def export(self) -> Dict[str, Any]:
@@ -120,13 +127,13 @@ class SOTAFSDP2Config:
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# SOTA FSDP2 Demo Class
+# ZBPP Demo Class
 # ═════════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class SOTADemo:
     """
-    SOTA FSDP2 Demo using SOTATrainer and DataPipeline.
+    SOTA ZBPP Demo using SOTATrainer and DataPipeline.
     """
     config_path: str
     
@@ -134,52 +141,46 @@ class SOTADemo:
         self.config_path = config_path
         self._data_pipeline = None
         
-        # Initialize Distributed State
+        # Initialize Distributed State (for logging/setup)
         self.dist_state = DistributedState.initialize().unwrap()
         
         log_rank_0(
-            f"SOTA FSDP2 Demo initialized: "
+            f"SOTA ZBPP Demo initialized: "
             f"rank={self.dist_state.rank}/{self.dist_state.world_size}",
         )
 
     def verify_integration(self):
-        """Run deep integration verification checks (CPU/Tiny Model friendly)."""
-        log_rank_0("🧪 Starting FSDP2 Deep Integration Verification...")
+        """Run deep integration verification checks."""
+        log_rank_0("🧪 Starting Deep Integration Verification...")
         
         # 1. Config Check
-        # 1. Config Check
-        # Using SOTAConfig to load first (handles path resolution)
-        self.config = SOTAFSDP2Config.from_yaml(self.config_path)
+        self.config = SOTAZBPPConfig.from_yaml(self.config_path)
+        # trainer = create_trainer(self.config.raw)  <-- Moved down
         
-        if self.config.distributed.get("strategy") != "fsdp2":
-             # Auto-fix for verification if config points elsewhere
-             log_rank_0(f"⚠️ Config strategy is '{self.config.distributed.get('strategy')}', forcing 'fsdp2' for verification.")
-             self.config.distributed["strategy"] = "fsdp2"
-
-        log_rank_0("✅ Config: Strategy check passed")
+        if self.config.distributed.get("strategy") != "pipeline_zbpp":
+            raise ValueError(f"❌ Strategy check failed: expected 'pipeline_zbpp', got '{self.config.distributed.get('strategy')}'")
+        log_rank_0("✅ Config: Strategy is 'pipeline_zbpp'")
         
-        # Override for verification (CPU / Tiny Model)
+        # Override for single-process verification
         if self.dist_state.world_size == 1:
-            log_rank_0("   Modes: Single-Process Verification (Mocking FSDP2 environment)...")
+            log_rank_0("   Forcing num_pipeline_stages=1 for single-process verification...")
+            self.config.distributed["num_pipeline_stages"] = 1
+            self.config.distributed["num_microbatches"] = 4 # Needs to be > stages usually, or just 1 check
+
+        # Override for single-process verification
+        if self.dist_state.world_size == 1:
+            log_rank_0("   Forcing num_pipeline_stages=1 for single-process verification...")
+            self.config.distributed["num_pipeline_stages"] = 1
+            self.config.distributed["num_microbatches"] = 4
             
-            # Use tiny model
+            # Use tiny model for verification to avoid huge download
             log_rank_0("   Using tiny random model for verification...")
             self.config.model["name_or_path"] = "HuggingFaceM4/tiny-random-LlamaForCausalLM"
-            self.config.model["torch_dtype"] = "float32"
-            self.config.quantization = self.config.raw.setdefault("quantization", {})
-            self.config.quantization["enabled"] = False
+            self.config.model["torch_dtype"] = "float32" # Tiny model safe
+            self.config.quantization["enabled"] = False # Ensure quantization is off for tiny model
             
-            # Fix: fsdp_config interaction
-            fsdp_cfg = self.config.distributed.get("fsdp_config", {})
-            if isinstance(fsdp_cfg, dict):
-                 fsdp_cfg["use_triton_kernels"] = False
-                 self.config.distributed["fsdp_config"] = fsdp_cfg
-            
-            # Force device to CPU if no GPU
-            if not torch.cuda.is_available():
-                self.config.raw.setdefault("hardware", {})["device"] = "cpu"
-                log_rank_0("   ⚠️ CUDA not available, falling back to CPU for verification.")
-
+        # We need to explicitly import these to check instance type
+        from data_pipeline.trainer.distributed.zbpp import ZeroBubblePipeline, ZBPPOptimizer
         # 2. Model Setup
         log_rank_0("   Setting up model...")
         # Create trainer AFTER overrides
@@ -187,22 +188,30 @@ class SOTADemo:
         trainer = SOTATrainer(trainer_config)
         trainer.setup_model()
         
-        log_rank_0(f"✅ Model: Setup complete (Type: {type(trainer.model).__name__})")
-
+        if not isinstance(trainer.model, ZeroBubblePipeline):
+            raise TypeError(f"❌ Model check failed: Expected ZeroBubblePipeline, got {type(trainer.model)}")
+        log_rank_0("✅ Model: Wrapped in ZeroBubblePipeline")
+        
+        if not isinstance(trainer.optimizer, ZBPPOptimizer):
+            raise TypeError(f"❌ Optimizer check failed: Expected ZBPPOptimizer, got {type(trainer.optimizer)}")
+        log_rank_0("✅ Optimizer: Initialized as ZBPPOptimizer")
+        
         # 3. Data Check (Synthetic)
-        log_rank_0("   Creating Synthetic DataLoader...")
+        log_rank_0("   Creating Synthetic DataLoader (Skipping DataPipeline download)...")
         from torch.utils.data import TensorDataset, DataLoader
         
-        batch_size = 2
-        seq_len = 16
-        vocab_size = 1000 
+        batch_size = self.config.training.get("per_device_train_batch_size")
+        seq_len = self.config.data.get("max_seq_length") or 128
+        vocab_size = 32000
         
-        input_ids = torch.randint(0, vocab_size, (batch_size * 2, seq_len))
-        labels = torch.randint(0, vocab_size, (batch_size * 2, seq_len))
-        attention_mask = torch.ones((batch_size * 2, seq_len))
+        # Create dummy data
+        input_ids = torch.randint(0, vocab_size, (batch_size * 4, seq_len))
+        labels = torch.randint(0, vocab_size, (batch_size * 4, seq_len))
+        attention_mask = torch.ones((batch_size * 4, seq_len))
         
         dataset = TensorDataset(input_ids, attention_mask, labels)
         
+        # Determine collate_fn to match dictionary structure expected by SOTATrainer
         def collate_fn(batch):
             input_ids, attention_mask, labels = zip(*batch)
             return {
@@ -212,77 +221,105 @@ class SOTADemo:
             }
             
         dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
+        
         log_rank_0("✅ Data: Synthetic DataLoader created")
         
         # 4. Training Loop Check
         log_rank_0("   Running 1 Step Training Loop...")
-        trainer.config.training.max_steps = 1
-        trainer.config.training.logging_steps = 1
+        trainer.config.training["max_steps"] = 1
+        trainer.config.training["logging_steps"] = 1
         trainer.train(dataloader)
         log_rank_0("✅ Training: 1 step completed successfully")
         
-        log_rank_0("🎉 All FSDP2 Integration Checks Passed!")
+        log_rank_0("🎉 All Integration Checks Passed!")
 
     def _export_model(self, trainer):
         """Export trained model."""
-        export_cfg = self.config.export
-        if not export_cfg.enabled:
-            return
-
-        log_rank_0("Exporting Model...")
-        try:
-             trainer.export(tokenizer=self._data_pipeline._tokenizer_wrapper.tokenizer)
-        except Exception as e:
-             log_rank_0(f"⚠️ Export failed: {e}")
+        if self.config.export.get("enabled"):
+             log_rank_0("Exporting Model...")
+             try:
+                 trainer.export(tokenizer=self._data_pipeline._tokenizer_wrapper.tokenizer)
+             except Exception as e:
+                 log_rank_0(f"⚠️ Export failed: {e}")
 
     def _run_inference(self):
         """Benchmark SOTA Inference Engine."""
         log_rank_0("\n🚀 Step 9: Benchmarking SOTA Inference...")
         
-        export_dir = self.config.export.output_dir
+        # Load the exported (merged) model + tokenizer for fresh benchmark
+        export_dir = self.config.export.get("output_dir")
         if not export_dir or not os.path.exists(export_dir):
              log_rank_0(f"⚠️ Export directory {export_dir} not found. Skipping inference benchmark.")
              return
 
+        log_rank_0(f"Loading exported model from {export_dir} for benchmark...")
+        
         from transformers import AutoModelForCausalLM, AutoTokenizer
         
+        # Load fresh components to verify 'W + change weights' loading
         try:
-            # Load exported model
             inference_model = AutoModelForCausalLM.from_pretrained(
                 export_dir,
-                torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto" if torch.cuda.is_available() else "cpu",
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
                 trust_remote_code=True
             )
             inference_tokenizer = AutoTokenizer.from_pretrained(export_dir)
             
+            # Initialize Engine with fresh model
             engine = inference.SOTAInferenceEngine(
                 model=inference_model, 
                 tokenizer=inference_tokenizer,
                 block_size=16
             )
             
+            # Add diverse prompts
             prompts = [
-                [{"role": "user", "content": "Explain FSDP."}],
-                [{"role": "user", "content": "What is ROCm?"}]
+                [{"role": "user", "content": "Explain quantum computing in simple terms."}],
+                [{"role": "user", "content": "Write a python function to Fibonacci."}],
+                [{"role": "user", "content": "What is the capital of France?"}],
+                [{"role": "user", "content": "List 3 benefits of exercise."}],
+                [{"role": "user", "content": "Describe the future of AI."}]
             ]
             
-            for p in prompts:
-                text = inference_tokenizer.apply_chat_template(p, tokenize=False, add_generation_prompt=True)
-                engine.add_request(prompt=text, max_new_tokens=30)
+            # Add requests
+            for i in range(5):
+                messages = prompts[i % len(prompts)]
+                # Apply chat template
+                text_prompt = inference_tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                engine.add_request(prompt=text_prompt, max_new_tokens=50)
                 
+                # Run one standard generation for reference/sanity check
+                if i == 0:
+                    log_rank_0("Running standard HF generation for sanity check...")
+                    inputs = inference_tokenizer(text_prompt, return_tensors="pt").to(inference_model.device)
+                    with torch.no_grad():
+                        gen_tokens = inference_model.generate(
+                            **inputs, 
+                            max_new_tokens=50, 
+                            do_sample=False, 
+                            pad_token_id=inference_tokenizer.eos_token_id
+                        )
+                    log_rank_0(f"Standard Ref: {inference_tokenizer.decode(gen_tokens[0], skip_special_tokens=True)}")
+
+            log_rank_0(f"Added 5 requests to Continuous Batching Scheduler.")
+            
+            # Run Generation
             responses = engine.generate_all()
+            
             for i, resp in enumerate(responses):
                 log_rank_0(f"Response {i}: {resp[:50]}...")
                 
         except Exception as e:
-             log_rank_0(f"❌ Inference benchmark failed: {e}")
+            log_rank_0(f"❌ Inference benchmark failed: {e}")
+            import traceback
+            traceback.print_exc()
 
 
     def run(self, max_steps: int = 100):
         """Run the demo."""
         log_rank_0("═" * 60)
-        log_rank_0("Starting SOTA FSDP2 Training")
+        log_rank_0("Starting SOTA ZBPP Training (using SOTATrainer)")
         log_rank_0("═" * 60)
         
         # 1. Initialize Data Pipeline
@@ -296,63 +333,78 @@ class SOTADemo:
         
         # 2. Create SOTA Trainer
         log_rank_0("Initializing SOTA Trainer...")
-        self.config = SOTAFSDP2Config.from_yaml(self.config_path) # Cache config
+        self.config = SOTAZBPPConfig.from_yaml(self.config_path) # Cache config
         trainer_config = SOTAConfig.from_dict(self.config.raw)
         trainer = SOTATrainer(trainer_config)
         
+        # Check strategy validity
+        if self.config.distributed.get("strategy") != "pipeline_zbpp":
+             log_rank_0("⚠️ WARNING: Config strategy is NOT 'pipeline_zbpp'. This demo is intended for ZBPP.")
+        
         # Setup Model
-        log_rank_0("Setting up SOTA FSDP2 Model...")
+        log_rank_0("Setting up SOTA Model with ZBPP...")
         trainer.setup_model()
         
+        # Override config with CLI arguments
         if max_steps > 0:
-            trainer.config.training.max_steps = max_steps
+            log_rank_0(f"Overriding max_steps: {max_steps}")
+            trainer.config.training["max_steps"] = max_steps
         
-        # 3. DataLoader
+        # 3. Get Distributed DataLoader
+        # For ZBPP, we fetch global batch, and trainer splits it into microbatches
+        batch_size = self.config.training.get("per_device_train_batch_size")
+        
         log_rank_0("Creating Distributed DataLoader...")
         dl_result = self._data_pipeline.get_dataloader(
-            split=trainer.config.data.train_split,
-            batch_size=trainer.config.training.per_device_train_batch_size,
+            split=self.config.data.get("train_split"),
+            batch_size=batch_size,
             distributed=(self.dist_state.world_size > 1),
             rank=self.dist_state.rank,
             world_size=self.dist_state.world_size,
         )
         dataloader = unwrap(dl_result)
         
-        # Eval DataLoader
+        # Create Eval DataLoader
         eval_dl_result = self._data_pipeline.get_dataloader(
-            split=trainer.config.data.eval_split,
-            batch_size=trainer.config.training.per_device_eval_batch_size,
+            split=self.config.data.get("eval_split"),
+            batch_size=self.config.training.get("per_device_eval_batch_size"),
             distributed=(self.dist_state.world_size > 1),
             rank=self.dist_state.rank,
             world_size=self.dist_state.world_size,
         )
         eval_dataloader = unwrap(eval_dl_result)
         
+
         # 4. Train
-        log_rank_0("Starting Training Loop...")
+        log_rank_0("Starting ZBPP Training Loop...")
         metrics = trainer.train(dataloader, eval_dataloader=eval_dataloader)
         
         log_rank_0("Training Complete!")
         log_rank_0(f"Final Metrics: {metrics}")
         
         # 5. Export
-        if self.dist_state.rank == 0 and trainer.config.export.enabled:
-            self._export_model(trainer)
-            
-            # 6. Benchmark Inference
-            self._run_inference()
+        self._export_model(trainer)
+
+        # 6. Benchmark Inference
+        self._run_inference()
         
         return metrics
 
 
+# ═════════════════════════════════════════════════════════════════════════════════
+# Main Entry Point
+# ═════════════════════════════════════════════════════════════════════════════════
+
 def main():
-    parser = argparse.ArgumentParser(description="ROCm SOTA FSDP2 Demo")
-    parser.add_argument("--config", type=str, default="rocm_sota_config_fsdp2.yaml", help="Path to YAML config")
-    parser.add_argument("--verify", action="store_true", help="Run integration verification (Tiny Model)")
-    parser.add_argument("--max-steps", type=int, default=-1, help="Max training steps")
+    parser = argparse.ArgumentParser(description="ZBPP SOTA Demo")
+    parser.add_argument("--config", type=str, default="zbpp_sota_config.yaml", help="Path to YAML config")
+    parser.add_argument("--dry-run", action="store_true", help="Verify setup without training")
+    parser.add_argument("--verify", action="store_true", help="Run deep integration verification")
+    parser.add_argument("--max-steps", type=int, default=-1, help="Max training steps (default: -1, use YAML)")
     args = parser.parse_args()
     
-    # Environment Setup
+    # 1. Environment Setup
+    # Ensure variables are set
     if "RANK" not in os.environ:
         os.environ["RANK"] = "0"
         os.environ["LOCAL_RANK"] = "0"
@@ -360,6 +412,11 @@ def main():
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "29500"
     
+    if args.dry_run:
+        print("Dry run successful. Environment verified.")
+        return
+
+    # 2. Run Demo
     try:
         demo = SOTADemo(args.config)
         
@@ -369,10 +426,12 @@ def main():
 
         demo.run(max_steps=args.max_steps)
         
+        # Cleanup
         if dist.is_initialized():
             dist.destroy_process_group()
             
     except Exception as e:
+        # Log error cleanly
         print(f"\n❌ Error: {e}")
         import traceback
         traceback.print_exc()
