@@ -1149,3 +1149,55 @@ try:
 except ImportError:
     pass
 
+# New SOTA modules for gradient and activation handling
+from .hybrid_cp_scheduler import (
+    HybridCPConfig,
+    BalancedCPScheduler,
+    hybrid_context_parallel_forward_backward,
+)
+
+from .activation_offload import (
+    ActivationOffloadConfig,
+    TensorPool as OffloadTensorPool,
+    OffloadTensorGroup,
+    ChunkOffloadHandler,
+    PipelineOffloadManager,
+    print_offload_summary,
+)
+
+from .grad_buffer import (
+    ParamAndGradBuffer,
+    ParamAndGradBucketGroup,
+)
+
+from .reduce_scatter_fp32 import (
+    reduce_scatter_with_fp32_accumulation,
+)
+
+from .finalize_grads import (
+    finalize_model_grads,
+)
+
+# Extend __all__ with new exports
+__all__.extend([
+    # Hybrid CP Scheduler
+    "HybridCPConfig",
+    "BalancedCPScheduler",
+    "hybrid_context_parallel_forward_backward",
+    # Activation Offload
+    "ActivationOffloadConfig",
+    "OffloadTensorPool",
+    "OffloadTensorGroup",
+    "ChunkOffloadHandler",
+    "PipelineOffloadManager",
+    "print_offload_summary",
+    # Gradient Buffer
+    "ParamAndGradBuffer",
+    "ParamAndGradBucketGroup",
+    # FP32 Reduce-Scatter
+    "reduce_scatter_with_fp32_accumulation",
+    # Finalize Grads
+    "finalize_model_grads",
+])
+
+
