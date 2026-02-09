@@ -152,6 +152,14 @@ from data_pipeline.trainer.metrics import (
     MetricCollection,
     compute_accuracy,
     compute_f1,
+    # SOTA Training Metrics
+    LossTracker,
+    AccuracyTracker,
+    ThroughputTracker,
+    GradientTracker,
+    TrainingMetrics,
+    create_training_metrics,
+    sync_metrics,
 )
 
 from data_pipeline.trainer.trainers import (
@@ -164,14 +172,69 @@ from data_pipeline.trainer.trainers import (
 from data_pipeline.trainer.hub import (
     HubManager,
     generate_model_card,
+    # Checkpoint & Serialization
+    CheckpointManager,
+    ModelSerializer,
+    ModelDeserializer,
+    # Configuration
+    HubConfig,
+    # Error Handling
+    HubError,
+    HubErrorCode,
+    Ok,
+    Err,
+    # Resilience
+    CircuitBreaker,
+    RetryPolicy,
+    execute_with_retry,
+    # Metrics
+    HubMetrics,
+    get_hub_metrics,
 )
 
 from data_pipeline.trainer.kernels import (
+    # Basic kernels
     is_triton_available,
     fused_layer_norm,
     fused_softmax,
     fused_gelu,
     compile_model,
+    # Compilation
+    CompilationMode,
+    CompilationBackend,
+    get_kernel_capabilities,
+    # Flash Attention
+    FlashAttention,
+    MultiHeadFlashAttention,
+    is_flash_attn_available,
+    FlashAttentionConfig,
+    # Flex Attention
+    scaled_dot_product_attention,
+    create_causal_mask,
+    FlexAttentionConfig,
+    # RoPE
+    Fast_RoPE_Embedding,
+    fast_rope_embedding,
+    RoPEConfig,
+    # Norms & Activations
+    Fast_RMS_LayerNorm,
+    Fast_SwiGLU,
+    Fast_GeGLU,
+    fast_rms_layernorm,
+    swiglu_forward,
+    # LoRA Primitives
+    LoRA_MLP,
+    LoRA_QKV,
+    matmul_lora,
+    # FP8
+    FP8Linear,
+    FP8Config,
+    FP8Format,
+    row_quantize_fp8,
+    block_quantize_fp8,
+    # XE Loss
+    Fast_CrossEntropyLoss,
+    fast_cross_entropy_loss,
 )
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -204,13 +267,24 @@ from data_pipeline.trainer.schedulers import (
 # SOTA Losses
 from data_pipeline.trainer.loss import (
     ChunkedCrossEntropyLoss,
+    FusedCrossEntropyLoss,
     DistillationLoss,
+    FeatureDistillationLoss,
+    # Preference Optimization
     DPOLoss,
+    KTOLoss,
     ORPOLoss,
     SimPOLoss,
+    CPOLoss,
+    # Contrastive
     InfoNCELoss,
+    CLIPLoss,
+    # MoE Auxiliary
     ZLoss,
+    LoadBalancingLoss,
+    # Composite
     CompositeLoss,
+    LossRegistry,
 )
 
 # SOTA Config
@@ -385,6 +459,14 @@ __all__ = [
     "MetricCollection",
     "compute_accuracy",
     "compute_f1",
+    # SOTA Training Metrics
+    "LossTracker",
+    "AccuracyTracker",
+    "ThroughputTracker",
+    "GradientTracker",
+    "TrainingMetrics",
+    "create_training_metrics",
+    "sync_metrics",
     # ─────────────────────────────────────────────────────────────
     # Specialized Trainers
     # ─────────────────────────────────────────────────────────────
@@ -397,6 +479,19 @@ __all__ = [
     # ─────────────────────────────────────────────────────────────
     "HubManager",
     "generate_model_card",
+    "CheckpointManager",
+    "ModelSerializer",
+    "ModelDeserializer",
+    "HubConfig",
+    "HubError",
+    "HubErrorCode",
+    "Ok",
+    "Err",
+    "CircuitBreaker",
+    "RetryPolicy",
+    "execute_with_retry",
+    "HubMetrics",
+    "get_hub_metrics",
     # ─────────────────────────────────────────────────────────────
     # Kernels
     # ─────────────────────────────────────────────────────────────
@@ -405,6 +500,41 @@ __all__ = [
     "fused_softmax",
     "fused_gelu",
     "compile_model",
+    "CompilationMode",
+    "CompilationBackend",
+    "get_kernel_capabilities",
+    # Flash Attention
+    "FlashAttention",
+    "MultiHeadFlashAttention",
+    "is_flash_attn_available",
+    "FlashAttentionConfig",
+    # Flex Attention
+    "scaled_dot_product_attention",
+    "create_causal_mask",
+    "FlexAttentionConfig",
+    # RoPE
+    "Fast_RoPE_Embedding",
+    "fast_rope_embedding",
+    "RoPEConfig",
+    # Norms & Activations
+    "Fast_RMS_LayerNorm",
+    "Fast_SwiGLU",
+    "Fast_GeGLU",
+    "fast_rms_layernorm",
+    "swiglu_forward",
+    # LoRA Primitives
+    "LoRA_MLP",
+    "LoRA_QKV",
+    "matmul_lora",
+    # FP8
+    "FP8Linear",
+    "FP8Config",
+    "FP8Format",
+    "row_quantize_fp8",
+    "block_quantize_fp8",
+    # XE Loss
+    "Fast_CrossEntropyLoss",
+    "fast_cross_entropy_loss",
     # ═════════════════════════════════════════════════════════════
     # SOTA (Above Unsloth Level)
     # ═════════════════════════════════════════════════════════════
@@ -427,13 +557,20 @@ __all__ = [
     "create_sota_scheduler",
     # SOTA Losses
     "ChunkedCrossEntropyLoss",
+    "FusedCrossEntropyLoss",
     "DistillationLoss",
+    "FeatureDistillationLoss",
     "DPOLoss",
+    "KTOLoss",
     "ORPOLoss",
     "SimPOLoss",
+    "CPOLoss",
     "InfoNCELoss",
+    "CLIPLoss",
     "ZLoss",
+    "LoadBalancingLoss",
     "CompositeLoss",
+    "LossRegistry",
     # SOTA Config
     "SOTAConfig",
     "SOTATrainingMode",

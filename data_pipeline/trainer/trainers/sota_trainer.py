@@ -39,18 +39,41 @@ from torch.utils.data import DataLoader, Dataset
 import torch.distributed as dist
 
 # ═════════════════════════════════════════════════════════════════════════════════
-# Internal Imports
+# Internal Imports - Distributed
 # ═════════════════════════════════════════════════════════════════════════════════
 
 from data_pipeline.trainer.distributed import (
+    # DDP
     DDPInitializer,
     create_ddp_from_yaml,
     create_ddp_engine,
-    create_fsdp2_from_dict,
     SOTADDP,
+    DDPConfig,
+    # FSDP2
+    create_fsdp2_from_dict,
     SOTAFSDP2,
     FSDPCheckpointManager,
+    FSDP2Config,
+    ShardingStrategy,
+    # Context Parallel
+    ContextParallelEngine,
+    create_context_parallel_engine,
+    # Activation Checkpoint
+    ActivationCheckpoint,
+    create_activation_checkpoint,
+    # Utilities
+    DistributedState,
+    is_main_process,
+    get_world_info,
+    set_deterministic_seed,
+    log_rank_0,
+    # SOTA: Gradient sync context
+    no_sync,
 )
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Internal Imports - Core Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
 
 from data_pipeline.trainer.core.sota_config import (
     SOTAConfig,
@@ -61,6 +84,147 @@ from data_pipeline.trainer.core.sota_config import (
     LossType,
     RLAlgorithm,
     ExportFormat,
+)
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Internal Imports - Callbacks
+# ═════════════════════════════════════════════════════════════════════════════════
+
+from data_pipeline.trainer.callbacks import (
+    Callback,
+    CallbackHandler,
+    CallbackContext,
+    EarlyStoppingCallback,
+    CheckpointCallback,
+    LoggingCallback,
+    ProgressCallback,
+)
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Internal Imports - Metrics
+# ═════════════════════════════════════════════════════════════════════════════════
+
+from data_pipeline.trainer.metrics import (
+    LossTracker,
+    AccuracyTracker,
+    ThroughputTracker,
+    GradientTracker,
+    TrainingMetrics,
+    create_training_metrics,
+    sync_metrics,
+    is_distributed as metrics_is_distributed,
+)
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Internal Imports - Loss Functions
+# ═════════════════════════════════════════════════════════════════════════════════
+
+from data_pipeline.trainer.loss import (
+    # Base losses
+    CrossEntropyLoss,
+    KLDivergenceLoss,
+    FocalLoss,
+    create_loss,
+    # SOTA losses
+    ChunkedCrossEntropyLoss,
+    FusedCrossEntropyLoss,
+    DistillationLoss,
+    # Preference optimization
+    DPOLoss,
+    KTOLoss,
+    ORPOLoss,
+    SimPOLoss,
+    CPOLoss,
+    # Contrastive
+    InfoNCELoss,
+    CLIPLoss,
+    # MoE auxiliary
+    ZLoss,
+    LoadBalancingLoss,
+    # Registry
+    LossRegistry,
+)
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Internal Imports - Optimizers
+# ═════════════════════════════════════════════════════════════════════════════════
+
+from data_pipeline.trainer.optimizers import (
+    AdamW,
+    LAMB,
+    AdaFactor,
+    Adam8bit,
+    Lion,
+    CAME,
+    SophiaG,
+    Prodigy,
+    FusedAdamW,
+    create_optimizer,
+    clip_grad_norm_,
+)
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Internal Imports - Schedulers
+# ═════════════════════════════════════════════════════════════════════════════════
+
+from data_pipeline.trainer.schedulers import (
+    BaseScheduler,
+    CosineScheduler,
+    LinearScheduler,
+    create_scheduler,
+    # SOTA schedulers
+    WSDScheduler,
+    REXScheduler,
+    create_sota_scheduler,
+)
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Internal Imports - Hub
+# ═════════════════════════════════════════════════════════════════════════════════
+
+from data_pipeline.trainer.hub import (
+    HubManager,
+    CheckpointManager,
+    ModelSerializer,
+    HubConfig,
+    HubError,
+    Ok,
+    Err,
+    get_hub_metrics,
+)
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Internal Imports - Kernels
+# ═════════════════════════════════════════════════════════════════════════════════
+
+from data_pipeline.trainer.kernels import (
+    compile_model,
+    CompilationMode,
+    is_triton_available,
+    get_kernel_capabilities,
+    # Flash Attention
+    FlashAttention,
+    is_flash_attn_available,
+    # RoPE
+    Fast_RoPE_Embedding,
+    # Norms & Activations
+    Fast_RMS_LayerNorm,
+    Fast_SwiGLU,
+    fused_layer_norm,
+    # FP8
+    FP8Linear,
+    FP8Config,
+)
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Internal Imports - Registry
+# ═════════════════════════════════════════════════════════════════════════════════
+
+from data_pipeline.trainer.registry import (
+    patch_model,
+    get_model_info,
+    ModelInfo,
+    register_model,
 )
 
 logger = logging.getLogger(__name__)
@@ -121,11 +285,37 @@ class SOTATrainer:
         self.loss_fn: Optional[nn.Module] = None
         self.scaler: Optional[torch.cuda.amp.GradScaler] = None
         
+        # ─────────────────────────────────────────────────────────────────────
+        # Callback Handler - Integrates all callback APIs
+        # ─────────────────────────────────────────────────────────────────────
+        self.callback_handler = CallbackHandler()
+        self._setup_default_callbacks()
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # Training Metrics - Unified metrics collection from metrics sub-module
+        # ─────────────────────────────────────────────────────────────────────
+        self.training_metrics: Optional[TrainingMetrics] = None
+        self.loss_tracker: Optional[LossTracker] = None
+        self.throughput_tracker: Optional[ThroughputTracker] = None
+        self.gradient_tracker: Optional[GradientTracker] = None
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # Hub Integration - Checkpoint and model management from hub sub-module
+        # ─────────────────────────────────────────────────────────────────────
+        self.checkpoint_manager: Optional[CheckpointManager] = None
+        self.hub_manager: Optional[HubManager] = None
+        self.model_serializer: Optional[ModelSerializer] = None
+        
+        # ─────────────────────────────────────────────────────────────────────
+        # Kernel Capabilities - From kernels sub-module
+        # ─────────────────────────────────────────────────────────────────────
+        self.kernel_capabilities = get_kernel_capabilities()
+        
         # Distributed Initialization
         self.distributed_strategy = config.distributed.strategy if hasattr(config.distributed, "strategy") else None
         if self.distributed_strategy in ("ddp", "fsdp", "fsdp2", "sota_fsdp"):
              DDPInitializer.init_process_group()
-             logger.info(f"Initialized distributed process group for strategy: {self.distributed_strategy}")
+             log_rank_0(f"Initialized distributed process group for strategy: {self.distributed_strategy}")
         
         # Device setup
         self.device = self._setup_device()
@@ -134,7 +324,13 @@ class SOTATrainer:
         # Mixed precision context
         self.amp_context = self._setup_amp_context()
         
-        logger.info(f"SOTATrainer initialized: mode={config.training_mode.value}, device={self.device}")
+        # Initialize metrics trackers
+        self._setup_metrics()
+        
+        # Initialize hub components
+        self._setup_hub()
+        
+        log_rank_0(f"SOTATrainer initialized: mode={config.training_mode.value}, device={self.device}")
     
     # ═════════════════════════════════════════════════════════════════════════════
     # Device Setup
@@ -177,6 +373,159 @@ class SOTATrainer:
         else:
             return lambda: nullcontext()
     
+    def _setup_default_callbacks(self) -> None:
+        """Setup default callbacks from callbacks sub-module."""
+        train_cfg = self.config.training
+        
+        # Add logging callback
+        self.callback_handler.add_callback(LoggingCallback(
+            log_interval=getattr(train_cfg, 'logging_steps', 100)
+        ))
+        
+        # Add progress callback
+        self.callback_handler.add_callback(ProgressCallback())
+        
+        # Add checkpoint callback if configured
+        if hasattr(train_cfg, 'save_steps') and train_cfg.save_steps > 0:
+            self.callback_handler.add_callback(CheckpointCallback(
+                save_dir=getattr(train_cfg, 'output_dir', './checkpoints'),
+                save_steps=train_cfg.save_steps,
+            ))
+        
+        # Add early stopping if configured
+        if hasattr(train_cfg, 'early_stopping_patience') and train_cfg.early_stopping_patience > 0:
+            self.callback_handler.add_callback(EarlyStoppingCallback(
+                patience=train_cfg.early_stopping_patience,
+                min_delta=getattr(train_cfg, 'early_stopping_threshold', 0.0),
+            ))
+    
+    def _setup_metrics(self) -> None:
+        """Setup training metrics from metrics sub-module."""
+        # Initialize individual trackers for granular control
+        self.loss_tracker = LossTracker(
+            ema_alpha=0.99,
+            window_size=100,
+        )
+        
+        self.throughput_tracker = ThroughputTracker(
+            window_size=100,
+        )
+        
+        self.gradient_tracker = GradientTracker(
+            track_per_layer=getattr(self.config, 'track_gradient_per_layer', False),
+        )
+        
+        # Create unified training metrics if available
+        try:
+            self.training_metrics = create_training_metrics(
+                loss_tracker=self.loss_tracker,
+                throughput_tracker=self.throughput_tracker,
+                gradient_tracker=self.gradient_tracker,
+                distributed=metrics_is_distributed(),
+            )
+        except Exception as e:
+            logger.warning(f"Could not create unified TrainingMetrics: {e}")
+            self.training_metrics = None
+    
+    def _setup_hub(self) -> None:
+        """Setup hub integration from hub sub-module."""
+        export_cfg = self.config.export
+        train_cfg = self.config.training
+        
+        # Initialize checkpoint manager
+        checkpoint_dir = getattr(train_cfg, 'output_dir', './checkpoints')
+        max_checkpoints = getattr(train_cfg, 'save_total_limit', 3)
+        
+        try:
+            self.checkpoint_manager = CheckpointManager(
+                checkpoint_dir=Path(checkpoint_dir),
+                max_checkpoints=max_checkpoints,
+            )
+        except Exception as e:
+            logger.warning(f"Could not initialize CheckpointManager: {e}")
+        
+        # Initialize hub manager for push operations
+        if hasattr(export_cfg, 'push_to_hub') and export_cfg.push_to_hub:
+            try:
+                hub_config = HubConfig(
+                    token=getattr(export_cfg, 'hub_token', None),
+                    repo_id=getattr(export_cfg, 'hub_model_id', None),
+                    private=getattr(export_cfg, 'hub_private', False),
+                )
+                self.hub_manager = HubManager(config=hub_config)
+            except Exception as e:
+                logger.warning(f"Could not initialize HubManager: {e}")
+        
+        # Initialize model serializer
+        self.model_serializer = ModelSerializer(
+            shard_size_bytes=5 * 1024**3,  # 5GB default shards
+            prefer_safetensors=True,
+        )
+    
+    # ═════════════════════════════════════════════════════════════════════════════
+    # Numerical Stability - SOTA: NaN/Inf Detection
+    # ═════════════════════════════════════════════════════════════════════════════
+    
+    def _check_numerical_stability(
+        self, 
+        loss: Tensor, 
+        grad_norm: Optional[float] = None,
+        step: Optional[int] = None,
+    ) -> bool:
+        """
+        Check for numerical stability issues.
+        
+        Args:
+            loss: Current loss tensor
+            grad_norm: Optional gradient norm
+            step: Current step for logging
+            
+        Returns:
+            True if stable, False if NaN/Inf detected
+        """
+        step_info = f" at step {step}" if step is not None else ""
+        
+        # Loss stability
+        if torch.isnan(loss) or torch.isinf(loss):
+            log_rank_0(
+                f"⚠️ NaN/Inf loss detected{step_info}: {loss.item():.4e}",
+                level="warning"
+            )
+            return False
+        
+        # Gradient stability
+        if grad_norm is not None:
+            if grad_norm != grad_norm:  # NaN check
+                log_rank_0(f"⚠️ NaN gradient norm{step_info}", level="warning")
+                return False
+            if grad_norm > 1e6:
+                log_rank_0(
+                    f"⚠️ Exploding gradient{step_info}: {grad_norm:.2e}",
+                    level="warning"
+                )
+                # Don't return False - clipping should handle this
+        
+        return True
+    
+    def _get_no_sync_context(self, should_sync: bool):
+        """
+        Get gradient sync context for gradient accumulation.
+        
+        When NOT syncing (during accumulation), disable DDP gradient sync
+        to avoid redundant all-reduces.
+        
+        Args:
+            should_sync: Whether this step should sync gradients
+            
+        Returns:
+            no_sync context if not syncing, else nullcontext
+        """
+        if should_sync:
+            return nullcontext()
+        
+        # Only use no_sync for DDP-wrapped models
+        return no_sync(self.model)
+    
     # ═════════════════════════════════════════════════════════════════════════════
     # Model Setup
     # ═════════════════════════════════════════════════════════════════════════════
@@ -212,45 +561,118 @@ class SOTATrainer:
         # Move to device (Essential before DDP/FSDP wrapping)
         self.model = self.model.to(self.device)
         
-        # SOTA Distributed Wrapping
+        # ─────────────────────────────────────────────────────────────
+        # SOTA Distributed Wrapping with Enhanced Configuration
+        # ─────────────────────────────────────────────────────────────
+        
         if self.distributed_strategy == "ddp":
-            logger.info("Applying SOTA DDP wrapper...")
-            ddp_params = self.config.to_dict().get("distributed", {}).get("ddp", {})
-            self.model = create_ddp_engine(**ddp_params).unwrap().wrap_model(self.model)
+            log_rank_0("Applying SOTA DDP wrapper with optimization flags...")
+            
+            # SOTA DDP settings
+            ddp_config = self.config.to_dict().get("distributed", {}).get("ddp", {})
+            ddp_params = {
+                "gradient_as_bucket_view": True,  # Memory efficiency: ~10-15% savings
+                "static_graph": True,  # Performance: enables gradient sync optimization
+                "find_unused_parameters": ddp_config.get("find_unused_parameters", False),
+                "broadcast_buffers": ddp_config.get("broadcast_buffers", True),
+            }
+            ddp_params.update(ddp_config)
+            
+            try:
+                self.model = create_ddp_engine(**ddp_params).unwrap().wrap_model(self.model)
+                log_rank_0(f"  ✓ DDP wrapper applied (static_graph={ddp_params['static_graph']})")
+            except Exception as e:
+                logger.error(f"DDP wrapping failed: {e}")
+                raise
         
         elif self.distributed_strategy in ("fsdp", "fsdp2", "sota_fsdp"):
-            logger.info(f"Applying SOTA FSDP2 wrapper ({self.distributed_strategy})...")
-            # FSDP requires model on CPU generally, but SOTA wrapper handles conversion
-            # Using to_dict() assuming config object has this method or accessible dict
-            fsdp_wrapper = create_fsdp2_from_dict(self.config.to_dict())
-            self.model = fsdp_wrapper.wrap_model(self.model)
+            log_rank_0(f"Applying SOTA FSDP2 wrapper ({self.distributed_strategy})...")
             
-            # Ensure optimizer knows about FSDP params if needed
-            # (prepare_optimizer will be called later if needed by user, 
-            # but standard construction might need awareness)
+            # SOTA FSDP2 settings with mixed precision for numerical stability
+            fsdp_config = self.config.to_dict()
+            
+            # Ensure use_orig_params=True for torch.compile compatibility
+            if "distributed" not in fsdp_config:
+                fsdp_config["distributed"] = {}
+            fsdp_config["distributed"]["use_orig_params"] = self.config.hardware.compile_model
+            fsdp_config["distributed"]["limit_all_gathers"] = True  # Memory optimization
+            
+            # Create mixed precision policy for numerical stability
+            # reduce_dtype=float32 prevents underflow during gradient reduction
+            if hasattr(self.config.hardware, "precision"):
+                precision = self.config.hardware.precision
+                if precision in (Precision.BF16, Precision.FP16):
+                    fsdp_config["distributed"]["mixed_precision"] = {
+                        "param_dtype": str(precision.value).lower(),
+                        "reduce_dtype": "fp32",  # SOTA: Always reduce in FP32
+                        "buffer_dtype": str(precision.value).lower(),
+                    }
+            
+            try:
+                fsdp_wrapper = create_fsdp2_from_dict(fsdp_config)
+                self.model = fsdp_wrapper.wrap_model(self.model)
+                log_rank_0(f"  ✓ FSDP2 wrapper applied (limit_all_gathers=True)")
+            except Exception as e:
+                logger.error(f"FSDP2 wrapping failed: {e}")
+                raise
         
         elif self.distributed_strategy == "pipeline_zbpp":
-            logger.info("Applying SOTA ZBPP Pipeline wrapper...")
+            log_rank_0("Applying SOTA ZBPP Pipeline wrapper...")
             from data_pipeline.trainer.distributed.zbpp import create_zbpp_pipeline
             
-            # ZBPP handles partitioning and optimization
-            self.model = create_zbpp_pipeline(
-                model=self.model,
-                num_stages=self.config.distributed.num_pipeline_stages,
-                num_microbatches=self.config.distributed.num_microbatches,
-                memory_limit_gb=self.config.distributed.pipeline_memory_limit_gb,
-                lr=self.config.optimizer.learning_rate,
-                weight_decay=self.config.optimizer.weight_decay,
-                dtype=self.dtype,
-                rank=dist.get_rank() if dist.is_initialized() else 0,
-                world_size=dist.get_world_size() if dist.is_initialized() else 1,
-            )
-            # ZBPP manages its own optimizer
-            self.optimizer = self.model._optimizer
+            # Validate microbatch configuration
+            num_stages = self.config.distributed.num_pipeline_stages
+            num_microbatches = self.config.distributed.num_microbatches
+            
+            if num_microbatches < num_stages:
+                logger.warning(
+                    f"num_microbatches ({num_microbatches}) < num_stages ({num_stages}), "
+                    f"adjusting to {num_stages} for efficiency"
+                )
+                num_microbatches = num_stages
+            
+            try:
+                self.model = create_zbpp_pipeline(
+                    model=self.model,
+                    num_stages=num_stages,
+                    num_microbatches=num_microbatches,
+                    memory_limit_gb=self.config.distributed.pipeline_memory_limit_gb,
+                    lr=self.config.optimizer.learning_rate,
+                    weight_decay=self.config.optimizer.weight_decay,
+                    dtype=self.dtype,
+                    rank=dist.get_rank() if dist.is_initialized() else 0,
+                    world_size=dist.get_world_size() if dist.is_initialized() else 1,
+                )
+                # ZBPP manages its own optimizer
+                self.optimizer = self.model._optimizer
+                log_rank_0(f"  ✓ ZBPP wrapper applied (stages={num_stages}, μB={num_microbatches})")
+            except Exception as e:
+                logger.error(f"ZBPP wrapping failed: {e}")
+                raise
         
-        # Compile if enabled (and compatible)
+        elif self.distributed_strategy == "context_parallel":
+            log_rank_0("Applying SOTA Context Parallel wrapper for long sequences...")
+            
+            cp_size = getattr(self.config.distributed, "context_parallel_size", 2)
+            try:
+                cp_engine = create_context_parallel_engine(
+                    model=self.model,
+                    cp_size=cp_size,
+                    device=self.device,
+                )
+                self.model = cp_engine.wrap_model()
+                log_rank_0(f"  ✓ Context Parallel wrapper applied (cp_size={cp_size})")
+            except Exception as e:
+                logger.error(f"Context Parallel wrapping failed: {e}")
+                raise
+        
+        # ─────────────────────────────────────────────────────────────
+        # Model Compilation (if enabled)
+        # ─────────────────────────────────────────────────────────────
+        
         if self.config.hardware.compile_model:
-            # Note: FSDP + torch.compile requires use_orig_params=True
+            # Note: FSDP + torch.compile requires use_orig_params=True (set above)
+            log_rank_0(f"Compiling model with mode={self.config.hardware.compile_mode}...")
             self.model = torch.compile(
                 self.model,
                 mode=self.config.hardware.compile_mode,
@@ -621,27 +1043,38 @@ class SOTATrainer:
                     batch = {k: v.to(self.device) if isinstance(v, Tensor) else v for k, v in batch.items()}
                     
                     if self.distributed_strategy == "pipeline_zbpp":
-                         # ZBPP expects list of microbatches, but our dataloader yields global batches
-                         # create_zbpp_pipeline setup expects us to pass inputs to train_step?
-                         # Wait, SOTATrainer.train calls self.model(inputs)
-                         # self.model is ZeroBubblePipeline
-                         # ZeroBubblePipeline.train_step signature: (micro_batches, labels, loss_fn)
-                         # We need to reshape batch into microbatches here?
-                         # Or ZeroBubblePipeline should handle it? 
-                         # ZBPP implementation expects list of tensors.
-                         
-                         # Splitting batch into microbatches
+                         # ─────────────────────────────────────────────────────
+                         # SOTA ZBPP: Robust microbatch handling
+                         # ─────────────────────────────────────────────────────
                          num_mb = self.config.distributed.num_microbatches
-                         mb_size = batch["input_ids"].size(0) // num_mb
+                         batch_size = batch["input_ids"].size(0)
+                         
+                         # Handle batch size not divisible by num_microbatches
+                         if batch_size < num_mb:
+                             num_mb = batch_size
+                         mb_size = batch_size // num_mb
+                         
+                         if mb_size == 0:
+                             logger.warning(f"Batch size {batch_size} too small for {num_mb} microbatches, skipping")
+                             continue
                          
                          micro_inputs = list(batch["input_ids"].split(mb_size))
                          micro_labels = list(batch["labels"].split(mb_size))
                          
-                         outputs = self.model.train_step(
-                             micro_batches=micro_inputs,
-                             labels=micro_labels,
-                             loss_fn=self.loss_fn
-                         )
+                         # Include attention mask if available
+                         micro_masks = None
+                         if batch.get("attention_mask") is not None:
+                             micro_masks = list(batch["attention_mask"].split(mb_size))
+                         
+                         try:
+                             outputs = self.model.train_step(
+                                 micro_batches=micro_inputs,
+                                 labels=micro_labels,
+                                 loss_fn=self.loss_fn
+                             )
+                         except Exception as e:
+                             logger.error(f"ZBPP train_step failed: {e}")
+                             continue
                     else:
                         outputs = self.model(
                         input_ids=batch["input_ids"],
@@ -653,14 +1086,15 @@ class SOTATrainer:
                     if self.distributed_strategy == "pipeline_zbpp":
                         # ZBPP returns dict with metrics, handled inside train_step
                         # It performs backward and optimizer step internally
-                        loss = outputs["loss"]
-                        # Metrics mapping
-                        loss_tracker.update(loss, num_tokens=1) # accumulation handled inside
-                        # Skip standard backward/optimizer logic
+                        loss = outputs.get("loss", torch.tensor(0.0))
                         
-                        # Log if needed
-                        if self.state.global_step % 10 == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
-                            pass
+                        # Numerical stability check for ZBPP
+                        if not self._check_numerical_stability(loss, step=self.state.global_step):
+                            logger.warning(f"ZBPP step {self.state.global_step} had numerical issues")
+                        
+                        # Proper token counting for metrics
+                        num_tokens = sum((labels != -100).sum().item() for labels in micro_labels)
+                        loss_tracker.update(loss, num_tokens=max(1, num_tokens))
                         
                         if self.scheduler:
                             self.scheduler.step()
@@ -708,18 +1142,30 @@ class SOTATrainer:
                     # Scale for accumulation
                     loss_scaled = loss / grad_accum
                 
-                # Backward pass
-                if self.scaler is not None:
-                    self.scaler.scale(loss_scaled).backward()
-                else:
-                    loss_scaled.backward()
+                # ─────────────────────────────────────────────────────────
+                # SOTA: Numerical stability check before backward
+                # ─────────────────────────────────────────────────────────
+                if not self._check_numerical_stability(loss, step=self.state.global_step):
+                    logger.warning(f"Skipping step {self.state.global_step} due to numerical instability")
+                    self.optimizer.zero_grad()
+                    continue
                 
-                if self.state.global_step % 10 == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
-                    # Debug log to verify liveness
-                    pass 
+                # ─────────────────────────────────────────────────────────
+                # SOTA: Use no_sync context during gradient accumulation
+                # This avoids redundant all-reduces, improving throughput
+                # ─────────────────────────────────────────────────────────
+                should_sync = (step + 1) % grad_accum == 0
+                sync_context = self._get_no_sync_context(should_sync)
+                
+                with sync_context:
+                    # Backward pass
+                    if self.scaler is not None:
+                        self.scaler.scale(loss_scaled).backward()
+                    else:
+                        loss_scaled.backward()
 
-                # Optimizer step
-                if (step + 1) % grad_accum == 0:
+                # Optimizer step (only when accumulation complete)
+                if should_sync:
                     if self.scaler is not None:
                         self.scaler.unscale_(self.optimizer)
                     
@@ -734,6 +1180,14 @@ class SOTATrainer:
                          # Some optimizers like Lion track this
                          grad_norm = self.optimizer.get_grad_norm()
                     
+                    # SOTA: Post-clip numerical stability check
+                    grad_norm_val = grad_norm if isinstance(grad_norm, float) else grad_norm.item()
+                    if not self._check_numerical_stability(loss, grad_norm=grad_norm_val, step=self.state.global_step):
+                        logger.warning(f"Skipping optimizer step due to gradient instability")
+                        self.optimizer.zero_grad()
+                        self.state.global_step += 1
+                        continue
+                    
                     if self.scaler is not None:
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
@@ -741,7 +1195,7 @@ class SOTATrainer:
                         self.optimizer.step()
                     
                     self.scheduler.step()
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)  # SOTA: set_to_none saves memory
                     self.state.global_step += 1
                     
                     # Logging (Rank 0 only)
