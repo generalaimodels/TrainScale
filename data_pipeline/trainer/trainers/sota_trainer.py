@@ -568,15 +568,16 @@ class SOTATrainer:
         if self.distributed_strategy == "ddp":
             log_rank_0("Applying SOTA DDP wrapper with optimization flags...")
             
-            # SOTA DDP settings
-            ddp_config = self.config.to_dict().get("distributed", {}).get("ddp", {})
+            # SOTA DDP settings from config (not hard-coded)
+            dist_cfg = self.config.distributed
             ddp_params = {
-                "gradient_as_bucket_view": True,  # Memory efficiency: ~10-15% savings
-                "static_graph": True,  # Performance: enables gradient sync optimization
-                "find_unused_parameters": ddp_config.get("find_unused_parameters", False),
-                "broadcast_buffers": ddp_config.get("broadcast_buffers", True),
+                "gradient_as_bucket_view": dist_cfg.ddp_gradient_as_bucket_view,
+                "static_graph": dist_cfg.ddp_static_graph,
+                "find_unused_parameters": dist_cfg.ddp_find_unused_parameters,
+                "broadcast_buffers": dist_cfg.ddp_broadcast_buffers,
             }
-            ddp_params.update(ddp_config)
+            # Allow legacy ddp_config dict to override
+            ddp_params.update(dist_cfg.ddp_config)
             
             try:
                 self.model = create_ddp_engine(**ddp_params).unwrap().wrap_model(self.model)
@@ -588,30 +589,35 @@ class SOTATrainer:
         elif self.distributed_strategy in ("fsdp", "fsdp2", "sota_fsdp"):
             log_rank_0(f"Applying SOTA FSDP2 wrapper ({self.distributed_strategy})...")
             
-            # SOTA FSDP2 settings with mixed precision for numerical stability
+            # SOTA FSDP2 settings from config (not hard-coded)
+            dist_cfg = self.config.distributed
             fsdp_config = self.config.to_dict()
             
-            # Ensure use_orig_params=True for torch.compile compatibility
             if "distributed" not in fsdp_config:
                 fsdp_config["distributed"] = {}
-            fsdp_config["distributed"]["use_orig_params"] = self.config.hardware.compile_model
-            fsdp_config["distributed"]["limit_all_gathers"] = True  # Memory optimization
             
-            # Create mixed precision policy for numerical stability
-            # reduce_dtype=float32 prevents underflow during gradient reduction
+            # Use config-driven settings
+            use_orig = dist_cfg.fsdp_use_orig_params or self.config.hardware.compile_model
+            fsdp_config["distributed"]["use_orig_params"] = use_orig
+            fsdp_config["distributed"]["limit_all_gathers"] = dist_cfg.fsdp_limit_all_gathers
+            fsdp_config["distributed"]["forward_prefetch"] = dist_cfg.fsdp_forward_prefetch
+            fsdp_config["distributed"]["backward_prefetch"] = dist_cfg.fsdp_backward_prefetch
+            fsdp_config["distributed"]["sharding_strategy"] = dist_cfg.fsdp_sharding_strategy
+            
+            # Create mixed precision policy using config reduce_dtype
             if hasattr(self.config.hardware, "precision"):
                 precision = self.config.hardware.precision
                 if precision in (Precision.BF16, Precision.FP16):
                     fsdp_config["distributed"]["mixed_precision"] = {
                         "param_dtype": str(precision.value).lower(),
-                        "reduce_dtype": "fp32",  # SOTA: Always reduce in FP32
+                        "reduce_dtype": dist_cfg.fsdp_reduce_dtype,  # From config
                         "buffer_dtype": str(precision.value).lower(),
                     }
             
             try:
                 fsdp_wrapper = create_fsdp2_from_dict(fsdp_config)
                 self.model = fsdp_wrapper.wrap_model(self.model)
-                log_rank_0(f"  ✓ FSDP2 wrapper applied (limit_all_gathers=True)")
+                log_rank_0(f"  ✓ FSDP2 applied (limit_all_gathers={dist_cfg.fsdp_limit_all_gathers})")
             except Exception as e:
                 logger.error(f"FSDP2 wrapping failed: {e}")
                 raise
@@ -1352,7 +1358,11 @@ class SOTATrainer:
         eval_dataloader: DataLoader,
         compute_metrics: Optional[Callable] = None,
     ) -> Dict[str, float]:
-        """Run evaluation."""
+        """Run evaluation with proper distributed synchronization."""
+        # SOTA: Barrier sync before evaluation ensures all ranks are ready
+        if dist.is_initialized():
+            dist.barrier()
+        
         self.model.eval()
         total_loss = 0.0
         num_batches = 0
@@ -1427,7 +1437,7 @@ class SOTATrainer:
     # ═════════════════════════════════════════════════════════════════════════════
     
     def save_checkpoint(self, path: Optional[str] = None):
-        """Save training checkpoint."""
+        """Save training checkpoint for all distributed strategies."""
         if path is None:
             path = os.path.join(
                 self.config.training.output_dir,
@@ -1436,38 +1446,66 @@ class SOTATrainer:
         
         os.makedirs(path, exist_ok=True)
         
-        # SOTA FSDP Handling
+        # ─────────────────────────────────────────────────────────────
+        # ZBPP Pipeline Parallelism Checkpoint
+        # ─────────────────────────────────────────────────────────────
+        if self.distributed_strategy == "pipeline_zbpp":
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            log_rank_0(f"Saving ZBPP pipeline checkpoint to {path}")
+            
+            # Each stage saves its partition
+            if hasattr(self.model, 'save_stage_checkpoint'):
+                self.model.save_stage_checkpoint(path)
+            else:
+                # Fallback: save model state per stage
+                stage_path = os.path.join(path, f"stage_{rank}_model.pt")
+                model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
+                torch.save(model_to_save.state_dict(), stage_path)
+            
+            # Save optimizer state per stage
+            if hasattr(self.model, "_optimizer"):
+                opt_path = os.path.join(path, f"stage_{rank}_optimizer.pt")
+                torch.save(self.model._optimizer.state_dict(), opt_path)
+            
+            # Save trainer state (rank 0 only for metadata)
+            if rank == 0:
+                self._save_trainer_state(path)
+            
+            if dist.is_initialized():
+                dist.barrier()  # Ensure all stages saved
+            return
+        
+        # ─────────────────────────────────────────────────────────────
+        # Context Parallel Checkpoint
+        # ─────────────────────────────────────────────────────────────
+        if self.distributed_strategy == "context_parallel":
+            if dist.is_initialized():
+                dist.barrier()  # Sync before checkpoint
+            log_rank_0(f"Saving Context Parallel checkpoint to {path}")
+            # Context parallel saves like standard DDP (unwrap and save)
+            # Falls through to standard handling below
+        
+        # ─────────────────────────────────────────────────────────────
+        # FSDP Sharded Checkpoint
+        # ─────────────────────────────────────────────────────────────
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         if isinstance(self.model, FSDP):
-            logger.info(f"Saving FSDP sharded checkpoint to {path}")
+            log_rank_0(f"Saving FSDP sharded checkpoint to {path}")
             FSDPCheckpointManager.save_sharded_checkpoint(
                 self.model,
                 self.optimizer,
                 path
             )
-            # Save state metadata and RNG
-            state_dict = {
-                "state": self.state,
-                "config": self.config.to_dict(),
-                "rng_state": {
-                    "python": random.getstate(),
-                    "numpy": np.random.get_state(),
-                    "torch": torch.get_rng_state(),
-                    "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
-                }
-            }
-            if self.scheduler:
-                state_dict["scheduler"] = self.scheduler.state_dict()
-                
-            torch.save(state_dict, os.path.join(path, "trainer_state.pt"))
+            self._save_trainer_state(path)
             return
 
-        # Standard Handling (DDP/Single GPU)
-        # Unwrap DDP if present
+        # ─────────────────────────────────────────────────────────────
+        # Standard DDP / Single GPU Checkpoint
+        # ─────────────────────────────────────────────────────────────
         model_to_save = self.model.module if hasattr(self.model, "module") else self.model
         
         if not dist.is_initialized() or dist.get_rank() == 0:
-            logger.info(f"Saving checkpoint to {path}")
+            log_rank_0(f"Saving checkpoint to {path}")
             
             # Save model
             if hasattr(model_to_save, 'save_pretrained'):
@@ -1475,9 +1513,9 @@ class SOTATrainer:
             else:
                 torch.save(model_to_save.state_dict(), os.path.join(path, "model.pt"))
             
-            # Save optimizer and scheduler
+            # Save optimizer, scheduler, state
             torch.save({
-                "optimizer": self.optimizer.state_dict(),
+                "optimizer": self.optimizer.state_dict() if self.optimizer else None,
                 "scheduler": self.scheduler.state_dict() if self.scheduler else None,
                 "state": self.state,
                 "config": self.config.to_dict(),
@@ -1489,79 +1527,142 @@ class SOTATrainer:
                 }
             }, os.path.join(path, "trainer_state.pt"))
             
-            logger.info(f"Checkpoint saved: {path}")
+            log_rank_0(f"Checkpoint saved: {path}")
+
+    def _save_trainer_state(self, path: str):
+        """Helper to save trainer state, scheduler, and RNG."""
+        torch.save({
+            "optimizer": self.optimizer.state_dict() if self.optimizer else None,
+            "scheduler": self.scheduler.state_dict() if self.scheduler else None,
+            "state": self.state,
+            "config": self.config.to_dict(),
+            "rng_state": {
+                "python": random.getstate(),
+                "numpy": np.random.get_state(),
+                "torch": torch.get_rng_state(),
+                "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            }
+        }, os.path.join(path, "trainer_state.pt"))
+    
+    def _load_trainer_state(self, path: str):
+        """Helper to load trainer state, scheduler, and RNG."""
+        state_path = os.path.join(path, "trainer_state.pt")
+        if not os.path.exists(state_path):
+            logger.warning(f"Trainer state not found at {state_path}")
+            return
+        
+        checkpoint = torch.load(state_path, map_location="cpu", weights_only=False)
+        self.state = checkpoint.get("state", self.state)
+        
+        if self.optimizer and checkpoint.get("optimizer"):
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer"])
+            except Exception as e:
+                logger.warning(f"Failed to load optimizer state: {e}")
+        
+        if self.scheduler and checkpoint.get("scheduler"):
+            try:
+                self.scheduler.load_state_dict(checkpoint["scheduler"])
+            except Exception as e:
+                logger.warning(f"Failed to load scheduler state: {e}")
+        
+        # Restore RNG state
+        if "rng_state" in checkpoint:
+            self._restore_rng_state(checkpoint["rng_state"])
+    
+    def _restore_rng_state(self, rng: Dict[str, Any]):
+        """Helper to restore RNG states."""
+        try:
+            random.setstate(rng["python"])
+            np.random.set_state(rng["numpy"])
+            torch.set_rng_state(rng["torch"].cpu() if hasattr(rng["torch"], 'cpu') else rng["torch"])
+            if rng.get("cuda") is not None and torch.cuda.is_available():
+                cuda_states = rng["cuda"]
+                if isinstance(cuda_states, list):
+                    torch.cuda.set_rng_state_all([t.cpu() if hasattr(t, 'cpu') else t for t in cuda_states])
+                else:
+                    torch.cuda.set_rng_state(cuda_states.cpu() if hasattr(cuda_states, 'cpu') else cuda_states)
+        except Exception as e:
+            logger.warning(f"Failed to restore RNG state: {e}")
     
     def load_checkpoint(self, path: str):
-        """Load training checkpoint."""
-        logger.info(f"Loading checkpoint from {path}")
+        """Load training checkpoint for all distributed strategies."""
+        log_rank_0(f"Loading checkpoint from {path}")
         
-        # SOTA FSDP Handling
+        # ─────────────────────────────────────────────────────────────
+        # ZBPP Pipeline Parallelism Checkpoint
+        # ─────────────────────────────────────────────────────────────
+        if self.distributed_strategy == "pipeline_zbpp":
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            log_rank_0(f"Loading ZBPP pipeline checkpoint from {path}")
+            
+            # Each stage loads its partition
+            if hasattr(self.model, 'load_stage_checkpoint'):
+                self.model.load_stage_checkpoint(path)
+            else:
+                # Fallback: load model state per stage
+                stage_path = os.path.join(path, f"stage_{rank}_model.pt")
+                if os.path.exists(stage_path):
+                    model_to_load = self.model.module if hasattr(self.model, 'module') else self.model
+                    model_to_load.load_state_dict(torch.load(stage_path, map_location=self.device))
+            
+            # Load optimizer state per stage
+            if hasattr(self.model, "_optimizer"):
+                opt_path = os.path.join(path, f"stage_{rank}_optimizer.pt")
+                if os.path.exists(opt_path):
+                    self.model._optimizer.load_state_dict(torch.load(opt_path, map_location=self.device))
+            
+            # Load trainer state
+            self._load_trainer_state(path)
+            
+            if dist.is_initialized():
+                dist.barrier()  # Ensure all stages loaded
+            return
+        
+        # ─────────────────────────────────────────────────────────────
+        # FSDP Sharded Checkpoint
+        # ─────────────────────────────────────────────────────────────
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         if isinstance(self.model, FSDP):
+            log_rank_0(f"Loading FSDP sharded checkpoint from {path}")
             FSDPCheckpointManager.load_sharded_checkpoint(
                 self.model,
                 self.optimizer,
                 path
             )
-            # Load state metadata
-            state_path = os.path.join(path, "trainer_state.pt")
-            if os.path.exists(state_path):
-                checkpoint = torch.load(state_path, map_location="cpu") # Meta on CPU
-                self.state = checkpoint["state"]
-                if self.scheduler and checkpoint.get("scheduler"):
-                    self.scheduler.load_state_dict(checkpoint["scheduler"])
-                 # Restore RNG
-                if "rng_state" in checkpoint:
-                     rng = checkpoint["rng_state"]
-                     try:
-                        random.setstate(rng["python"])
-                        np.random.set_state(rng["numpy"])
-                        torch.set_rng_state(rng["torch"].cpu())
-                        if rng["cuda"] is not None and torch.cuda.is_available():
-                            torch.cuda.set_rng_state_all([t.cpu() for t in rng["cuda"]] if isinstance(rng["cuda"], list) else rng["cuda"].cpu())
-                     except Exception as e:
-                        logger.warning(f"Failed to restore RNG state: {e}")
+            self._load_trainer_state(path)
             return
-
+        
+        # ─────────────────────────────────────────────────────────────
+        # Standard DDP / Single GPU / Context Parallel Checkpoint
+        # ─────────────────────────────────────────────────────────────
+        if self.distributed_strategy == "context_parallel" and dist.is_initialized():
+            dist.barrier()  # Sync before loading
+        
         # Load trainer state
-        state_path = os.path.join(path, "trainer_state.pt")
-        if os.path.exists(state_path):
-            checkpoint = torch.load(state_path, map_location=self.device, weights_only=False)
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
-            if self.scheduler and checkpoint.get("scheduler"):
-                self.scheduler.load_state_dict(checkpoint["scheduler"])
-            self.state = checkpoint["state"]
-            
-            # Restore RNG state
-            if "rng_state" in checkpoint:
-                rng = checkpoint["rng_state"]
-                try:
-                    random.setstate(rng["python"])
-                    np.random.set_state(rng["numpy"])
-                    torch.set_rng_state(rng["torch"].cpu())
-                    if rng["cuda"] is not None and torch.cuda.is_available():
-                        torch.cuda.set_rng_state_all([t.cpu() for t in rng["cuda"]] if isinstance(rng["cuda"], list) else rng["cuda"].cpu())
-                except Exception as e:
-                    logger.warning(f"Failed to restore RNG state: {e}")
+        self._load_trainer_state(path)
         
         # Load model
         if hasattr(self.model, 'load_adapter'):
-            # For PEFT models
+            # For PEFT/LoRA models
             try:
                 self.model.load_adapter(path, adapter_name="default")
             except Exception as e:
-                 # Try without adapter_name or log error
-                 logger.warning(f"Note: load_adapter failed with 'default' name, trying fallback or ignoring: {e}")
-                 try:
-                     self.model.load_adapter(path)
-                 except Exception as e2:
-                     logger.warning(f"Failed to load adapter: {e2}")
+                logger.warning(f"load_adapter failed: {e}, trying fallback")
+                try:
+                    self.model.load_adapter(path)
+                except Exception as e2:
+                    logger.warning(f"Failed to load adapter: {e2}")
         else:
             model_path = os.path.join(path, "model.pt")
             if os.path.exists(model_path):
-                self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+                model_to_load = self.model.module if hasattr(self.model, 'module') else self.model
+                model_to_load.load_state_dict(torch.load(model_path, map_location=self.device))
+            elif hasattr(self.model, 'from_pretrained'):
+                # HuggingFace model saved with save_pretrained
+                pass  # Model already loaded at init
         
-        logger.info(f"Checkpoint loaded: {path}")
+        log_rank_0(f"Checkpoint loaded: {path}")
     
     # ═════════════════════════════════════════════════════════════════════════════
     # Export

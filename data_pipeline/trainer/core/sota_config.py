@@ -311,6 +311,29 @@ class DistributedConfig:
     num_pipeline_stages: int = 4
     num_microbatches: int = 8
     pipeline_memory_limit_gb: float = 4.0
+    
+    # ═════════════════════════════════════════════════════════════════════════
+    # SOTA DDP Settings (config-driven, not hard-coded)
+    # ═════════════════════════════════════════════════════════════════════════
+    ddp_gradient_as_bucket_view: bool = True     # Memory efficiency: ~10-15% savings
+    ddp_static_graph: bool = True                # Enables gradient sync optimization
+    ddp_find_unused_parameters: bool = False     # Disable for performance if no unused params
+    ddp_broadcast_buffers: bool = True           # Sync batch norm stats
+    
+    # ═════════════════════════════════════════════════════════════════════════
+    # SOTA FSDP2 Settings (config-driven, not hard-coded)
+    # ═════════════════════════════════════════════════════════════════════════
+    fsdp_limit_all_gathers: bool = True          # Memory optimization
+    fsdp_use_orig_params: bool = False           # Auto-set True if compile_model=True
+    fsdp_reduce_dtype: str = "fp32"              # Numerical stability: always reduce in FP32
+    fsdp_sharding_strategy: str = "full"         # full, shard_grad_op, no_shard
+    fsdp_forward_prefetch: bool = True           # Performance optimization
+    fsdp_backward_prefetch: str = "backward_pre" # backward_pre or backward_post
+    
+    # ═════════════════════════════════════════════════════════════════════════
+    # Context Parallel Settings (for long sequences)
+    # ═════════════════════════════════════════════════════════════════════════
+    context_parallel_size: int = 2
 
 
 @dataclass
