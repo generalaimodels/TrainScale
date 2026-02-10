@@ -198,22 +198,10 @@ from data_pipeline.trainer.hub import (
 # ═════════════════════════════════════════════════════════════════════════════════
 
 from data_pipeline.trainer.kernels import (
-    compile_model,
-    CompilationMode,
+    # ── Only lightweight capability detection at import time ──────────────
     is_triton_available,
     get_kernel_capabilities,
-    # Flash Attention
-    FlashAttention,
     is_flash_attn_available,
-    # RoPE
-    Fast_RoPE_Embedding,
-    # Norms & Activations
-    Fast_RMS_LayerNorm,
-    Fast_SwiGLU,
-    fused_layer_norm,
-    # FP8
-    FP8Linear,
-    FP8Config,
 )
 
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -221,7 +209,6 @@ from data_pipeline.trainer.kernels import (
 # ═════════════════════════════════════════════════════════════════════════════════
 
 from data_pipeline.trainer.registry import (
-    patch_model,
     get_model_info,
     ModelInfo,
     register_model,
@@ -788,20 +775,571 @@ class SOTATrainer:
         
         return model
     
+    # ═════════════════════════════════════════════════════════════════════════
+    # Generalized Layer Detection (model-agnostic for any HuggingFace model)
+    # ═════════════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _is_mlp_swiglu(module: nn.Module) -> bool:
+        """Detect SwiGLU MLP layers via duck-typing (model-agnostic).
+
+        Covers: Llama, Mistral, Gemma, Qwen2, Phi-3, DeepSeek,
+                StableLM, InternLM, Yi, Cohere, and any model with
+                gate_proj + up_proj + down_proj.
+        """
+        return (
+            hasattr(module, 'gate_proj') and hasattr(module, 'up_proj')
+            and hasattr(module, 'down_proj')
+        )
+
+    @staticmethod
+    def _is_mlp_geglu(module: nn.Module) -> bool:
+        """Detect GeGLU MLP layers via duck-typing (model-agnostic).
+
+        Covers: GPT-J, GPT-NeoX, and models using wi_0 + wi_1 + wo
+                or fc1 + fc2 with gated activation.
+        """
+        return (
+            (hasattr(module, 'wi_0') and hasattr(module, 'wi_1')
+             and hasattr(module, 'wo'))
+            or (hasattr(module, 'fc1') and hasattr(module, 'fc2')
+                and hasattr(module, 'act'))
+        )
+
+    @staticmethod
+    def _is_mlp_standard(module: nn.Module) -> bool:
+        """Detect standard 2-layer MLP via duck-typing (model-agnostic).
+
+        Covers: GPT2, BLOOM, Falcon, OPT, and models using
+                dense_h_to_4h / dense_4h_to_h or c_fc / c_proj.
+        """
+        return (
+            (hasattr(module, 'dense_h_to_4h') and hasattr(module, 'dense_4h_to_h'))
+            or (hasattr(module, 'c_fc') and hasattr(module, 'c_proj'))
+            or (hasattr(module, 'fc_in') and hasattr(module, 'fc_out'))
+        )
+
+    @staticmethod
+    def _is_attention(module: nn.Module) -> bool:
+        """Detect attention layers via duck-typing (model-agnostic).
+
+        Covers ALL HuggingFace architectures:
+          - q_proj/k_proj/v_proj   → Llama, Mistral, Gemma, Qwen2, Phi
+          - query/key/value        → BERT, RoBERTa
+          - q/k/v                  → Compact attention
+          - query_key_value        → GPT-NeoX, Falcon, BLOOM
+          - Wqkv / qkv_proj       → Phi-2, DBRX
+          - c_attn                 → GPT2, GPT-J
+          - to_q/to_k/to_v        → Some custom models
+        """
+        # Separated Q/K/V projections
+        if (hasattr(module, 'q_proj') and hasattr(module, 'k_proj')
+                and hasattr(module, 'v_proj')):
+            return True
+        if (hasattr(module, 'query') and hasattr(module, 'key')
+                and hasattr(module, 'value')):
+            return True
+        if hasattr(module, 'q') and hasattr(module, 'k') and hasattr(module, 'v'):
+            return True
+        # Fused QKV projections
+        if hasattr(module, 'query_key_value'):
+            return True
+        if hasattr(module, 'Wqkv') or hasattr(module, 'qkv_proj'):
+            return True
+        if hasattr(module, 'c_attn'):
+            return True
+        # Alternative naming
+        if (hasattr(module, 'to_q') and hasattr(module, 'to_k')
+                and hasattr(module, 'to_v')):
+            return True
+        return False
+
+    @staticmethod
+    def _is_layernorm(module: nn.Module) -> bool:
+        """Detect LayerNorm/RMSNorm layers via class name (model-agnostic).
+
+        Uses re pattern to match ALL normalization variants across
+        HuggingFace: RMSNorm, LayerNorm, T5LayerNorm, GemmaRMSNorm,
+        LlamaRMSNorm, MistralRMSNorm, Qwen2RMSNorm, etc.
+        """
+        import re
+        cls_name = module.__class__.__name__
+        return bool(re.match(
+            r".*(?:RMS[_]?Norm|Layer[_]?Norm|GroupNorm|FusedNorm)",
+            cls_name, re.IGNORECASE
+        ))
+
+    @staticmethod
+    def _is_rope_embedding(module: nn.Module) -> bool:
+        """Detect RoPE embedding layers via duck-typing (model-agnostic).
+
+        Covers: LlamaRotaryEmbedding, MistralRotaryEmbedding,
+                GemmaRotaryEmbedding, Qwen2RotaryEmbedding, etc.
+        """
+        import re
+        cls_name = module.__class__.__name__
+        if re.match(r".*Rotary.*Embed.*", cls_name, re.IGNORECASE):
+            return True
+        if hasattr(module, 'inv_freq') and hasattr(module, 'cos_cached'):
+            return True
+        if hasattr(module, 'inv_freq') and hasattr(module, 'max_seq_len_cached'):
+            return True
+        return False
+
+    @staticmethod
+    def _is_moe_layer(module: nn.Module) -> bool:
+        """Detect MoE layers via duck-typing + class name (model-agnostic).
+
+        Covers: Mixtral, DeepSeek-MoE, Qwen2-MoE, DBRX, Grok,
+                Switch Transformer, and any model with experts + router/gate.
+        """
+        import re
+        cls_name = module.__class__.__name__
+        # Class name matching
+        if re.match(
+            r".*(?:SparseMoe|MoE|MixtureOfExperts|BlockSparse|"
+            r"ExpertLayer|SwitchTransformer|TopKGate).*",
+            cls_name, re.IGNORECASE
+        ):
+            return True
+        # Duck-typing: has experts list/module + routing mechanism
+        if hasattr(module, 'experts') and (
+            hasattr(module, 'gate') or hasattr(module, 'router')
+            or hasattr(module, 'gating_network')
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _has_lora_adapters(module: nn.Module) -> bool:
+        """Check if a Linear-like module has LoRA adapters attached.
+
+        Covers: PEFT LoRA, QLoRA, DoRA, rsLoRA — any adapter that
+        adds lora_A/lora_B or similar weight matrices.
+        """
+        if hasattr(module, 'lora_A') and hasattr(module, 'lora_B'):
+            return True
+        if hasattr(module, 'base_layer'):  # PEFT wrapper
+            return True
+        return False
+
     def _apply_kernel_optimizations(self, model: nn.Module) -> nn.Module:
-        """Apply Triton kernel optimizations."""
+        """
+        Apply comprehensive SOTA kernel optimizations with lazy loading.
+
+        All kernel imports are deferred to method-call time to avoid
+        import-time failures and reduce startup memory. Each phase lazily
+        loads only the kernel compounds it needs.
+
+        **Model-agnostic**: Uses duck-typing (attribute-based detection)
+        as the PRIMARY method and broad re patterns as SECONDARY fallback.
+        Works with ANY model from HuggingFace Hub regardless of naming
+        conventions: Llama, Mistral, Gemma, Phi, Falcon, GPT-NeoX,
+        BLOOM, Qwen, DeepSeek, DBRX, StableLM, Mixtral, Yi, etc.
+
+        Integrates ALL kernel compounds from data_pipeline.trainer.kernels:
+          Phase 1  → Hardware capability detection
+          Phase 2  → Layer patching (LayerNorm, MLP, Attention, RoPE)
+          Phase 3  → Fused Cross-Entropy loss kernel
+          Phase 4  → Fused LoRA MLP / QKV kernels
+          Phase 5  → MoE grouped-GEMM kernel configuration
+          Phase 6  → FP8 quantization (Hopper+ SM90+)
+          Phase 7  → Flex Attention backend selection
+          Phase 8  → Model compilation (torch.compile)
+          Phase 9  → Distributed kernel initialization
+          Phase 10 → Reporting & statistics
+
+        Every phase is gated by both KernelConfig flags AND hardware
+        capability detection. Failures fall back gracefully.
+        """
+        import re
+
         kernel_cfg = self.config.kernels
-        
+        hw_cfg = self.config.hardware
+        dist_cfg = self.config.distributed
+
         if not kernel_cfg.use_triton:
+            logger.info("Triton kernels disabled in config — skipping kernel optimizations")
             return model
-        
+
+        # ═════════════════════════════════════════════════════════════════════
+        # Phase 1: Hardware Capability Detection
+        # ═════════════════════════════════════════════════════════════════════
+        capabilities = get_kernel_capabilities()
+
+        triton_ok = capabilities.get("triton", False)
+        flash_ok = capabilities.get("flash_attn", False)
+        fp8_ok = capabilities.get("fp8", False)
+        bf16_ok = capabilities.get("bf16", False)
+        cuda_ok = capabilities.get("cuda", False)
+        tma_ok = capabilities.get("tma", False)
+        wgmma_ok = capabilities.get("wgmma", False)
+
+        # Lazy-load registry detection
         try:
-            from data_pipeline.trainer.registry import patch_model
-            model = patch_model(model)
-            logger.info("Applied SOTA kernel optimizations via registry")
-        except ImportError as e:
-            logger.warning(f"Triton kernels not available, using default implementations. Error: {e}")
-        
+            from data_pipeline.trainer.registry import detect_capabilities
+            hw_caps = detect_capabilities()
+        except (ImportError, Exception):
+            hw_caps = {}
+
+        logger.info(
+            f"SOTA Kernel Capabilities: triton={triton_ok}, flash_attn={flash_ok}, "
+            f"fp8={fp8_ok}, bf16={bf16_ok}, tma={tma_ok}, wgmma={wgmma_ok}"
+        )
+
+        applied_phases = []
+
+        # ═══════════════════════════════════════════════════════════════════
+        # Pre-scan: Build a generalized layer map for this model
+        #   Uses duck-typing so any HuggingFace architecture works.
+        # ═══════════════════════════════════════════════════════════════════
+        layer_map = {
+            "mlp_swiglu": [],     # gate_proj + up_proj + down_proj
+            "mlp_geglu": [],      # wi_0 + wi_1 + wo  OR fc1 + fc2 + act
+            "mlp_standard": [],   # dense_h_to_4h / c_fc / fc_in
+            "attention": [],      # q_proj/k_proj/v_proj OR query_key_value OR c_attn
+            "layernorm": [],      # *RMSNorm, *LayerNorm
+            "rope": [],           # *RotaryEmbedding, inv_freq+cos_cached
+            "moe": [],            # experts + gate/router
+            "linear": [],         # nn.Linear (for FP8)
+        }
+
+        for name, module in model.named_modules():
+            if self._is_mlp_swiglu(module):
+                layer_map["mlp_swiglu"].append((name, module))
+            elif self._is_mlp_geglu(module):
+                layer_map["mlp_geglu"].append((name, module))
+            elif self._is_mlp_standard(module):
+                layer_map["mlp_standard"].append((name, module))
+
+            if self._is_attention(module):
+                layer_map["attention"].append((name, module))
+
+            if self._is_layernorm(module):
+                layer_map["layernorm"].append((name, module))
+
+            if self._is_rope_embedding(module):
+                layer_map["rope"].append((name, module))
+
+            if self._is_moe_layer(module):
+                layer_map["moe"].append((name, module))
+
+            if isinstance(module, nn.Linear):
+                layer_map["linear"].append((name, module))
+
+        total_mlp = (len(layer_map["mlp_swiglu"]) + len(layer_map["mlp_geglu"])
+                     + len(layer_map["mlp_standard"]))
+        logger.info(
+            f"Model layer scan: "
+            f"mlp_swiglu={len(layer_map['mlp_swiglu'])}, "
+            f"mlp_geglu={len(layer_map['mlp_geglu'])}, "
+            f"mlp_standard={len(layer_map['mlp_standard'])}, "
+            f"attention={len(layer_map['attention'])}, "
+            f"layernorm={len(layer_map['layernorm'])}, "
+            f"rope={len(layer_map['rope'])}, "
+            f"moe={len(layer_map['moe'])}, "
+            f"linear={len(layer_map['linear'])}"
+        )
+
+        # ═════════════════════════════════════════════════════════════════════
+        # Phase 2: Layer Patching via KernelPatcher
+        #   — LayerNorm  → Triton Fast_RMS_LayerNorm / fused_layer_norm
+        #   — MLP        → Fused SwiGLU / GeGLU kernels
+        #   — Attention  → Flash Attention 2/3 config annotation
+        #   — RoPE       → Triton Fast_RoPE_Embedding config annotation
+        #   — FP8 Linear → FP8Linear wrapping (Hopper+)
+        # ═════════════════════════════════════════════════════════════════════
+        try:
+            from data_pipeline.trainer.registry import KernelPatcher
+            patcher = KernelPatcher(
+                patch_layernorm=kernel_cfg.use_fused_rms_norm and triton_ok,
+                patch_mlp=triton_ok,
+                patch_attention=kernel_cfg.use_flash_attention and (flash_ok or triton_ok),
+                patch_rope=kernel_cfg.use_fused_rope and triton_ok,
+                patch_fp8=fp8_ok,
+                verbose=True,
+            )
+            model = patcher.patch(model)
+            patch_stats = patcher.get_stats(model)
+            applied_phases.append("layer_patching")
+
+            logger.info(
+                f"Phase 2 — Layer patching complete: "
+                f"layernorm={patch_stats.get('layernorm_patched', 0)}/{patch_stats.get('layernorm_total', 0)}, "
+                f"mlp={patch_stats.get('mlp_patched', 0)}/{patch_stats.get('mlp_total', 0)}, "
+                f"attention={patch_stats.get('attention_patched', 0)}/{patch_stats.get('attention_total', 0)}, "
+                f"rope={patch_stats.get('rope_patched', 0)}/{patch_stats.get('rope_total', 0)}"
+            )
+        except Exception as e:
+            # Fallback: try simpler patch_model from registry
+            try:
+                from data_pipeline.trainer.registry import patch_model
+                model = patch_model(model)
+                applied_phases.append("layer_patching_basic")
+                logger.info("Phase 2 — Basic layer patching applied via registry.patch_model")
+            except Exception as e2:
+                logger.warning(f"Phase 2 — Layer patching failed completely: {e} → {e2}")
+
+        # ═════════════════════════════════════════════════════════════════════
+        # Phase 3: Fused Cross-Entropy Loss Kernel
+        #   — Replaces PyTorch CrossEntropyLoss with Triton-fused variant
+        #   — Chunked computation for large vocabularies (>64K tokens)
+        # ═════════════════════════════════════════════════════════════════════
+        if kernel_cfg.use_fused_cross_entropy and triton_ok:
+            try:
+                from data_pipeline.trainer.kernels import (
+                    fast_cross_entropy_loss,
+                    Fast_CrossEntropyLoss,
+                )
+                self._fused_cross_entropy_fn = fast_cross_entropy_loss
+                self._fused_cross_entropy_cls = Fast_CrossEntropyLoss
+                applied_phases.append("fused_cross_entropy")
+                logger.info("Phase 3 — Fused Cross-Entropy kernel enabled")
+            except Exception as e:
+                logger.warning(f"Phase 3 — Fused Cross-Entropy failed: {e}")
+
+        # ═════════════════════════════════════════════════════════════════════
+        # Phase 4: Fused LoRA MLP / QKV Kernels
+        #   Uses duck-typed layer_map — works with ANY architecture.
+        #   — LoRA_MLP: Fused gate+up+down with SwiGLU in single kernel
+        #   — LoRA_QKV: Fused Q/K/V projections with LoRA adapters
+        #   — matmul_lora: Optimized Y = X@W.T + scale*(X@A.T)@B.T
+        # ═════════════════════════════════════════════════════════════════════
+        if kernel_cfg.use_fused_lora and triton_ok:
+            try:
+                from data_pipeline.trainer.kernels import (
+                    LoRA_MLP,
+                    LoRA_QKV,
+                    apply_lora_mlp_swiglu,
+                    apply_lora_qkv,
+                    get_lora_parameters,
+                )
+                lora_patched = 0
+
+                # Patch SwiGLU MLP layers with LoRA fusion
+                for name, module in layer_map["mlp_swiglu"]:
+                    if self._has_lora_adapters(module.gate_proj):
+                        gate_params = get_lora_parameters(module.gate_proj)
+                        if gate_params[2] is not None:  # A matrix exists
+                            module._fused_lora_fn = LoRA_MLP
+                            module._lora_swiglu_fn = apply_lora_mlp_swiglu
+                            module._uses_fused_lora = True
+                            lora_patched += 1
+
+                # Patch Attention layers with LoRA fusion
+                for name, module in layer_map["attention"]:
+                    # Check separated Q/K/V projections
+                    q_mod = (getattr(module, 'q_proj', None)
+                             or getattr(module, 'query', None)
+                             or getattr(module, 'to_q', None))
+                    if q_mod is not None and self._has_lora_adapters(q_mod):
+                        q_params = get_lora_parameters(q_mod)
+                        if q_params[2] is not None:
+                            module._fused_lora_fn = LoRA_QKV
+                            module._lora_qkv_fn = apply_lora_qkv
+                            module._uses_fused_lora = True
+                            lora_patched += 1
+
+                if lora_patched > 0:
+                    applied_phases.append("fused_lora")
+                    logger.info(f"Phase 4 — Fused LoRA kernels: {lora_patched} layers annotated")
+                else:
+                    logger.info("Phase 4 — No LoRA adapters detected, skipping fused LoRA")
+            except Exception as e:
+                logger.warning(f"Phase 4 — Fused LoRA kernels failed: {e}")
+
+        # ═════════════════════════════════════════════════════════════════════
+        # Phase 5: MoE Grouped-GEMM Kernel Configuration
+        #   Uses duck-typed layer_map — works with ANY MoE architecture.
+        #   — Configures MoEKernelConfig with TMA/WGMMA when available
+        #   — Enables persistent kernels and L2 cache optimization
+        # ═════════════════════════════════════════════════════════════════════
+        if kernel_cfg.use_moe_kernels and triton_ok:
+            try:
+                from data_pipeline.trainer.kernels import (
+                    MoEKernelConfig,
+                    get_accelerator_arch,
+                )
+                arch = get_accelerator_arch()
+                moe_config = MoEKernelConfig(
+                    use_persistent_kernel=tma_ok,
+                    l2_cache_above_first_wave=tma_ok,
+                )
+
+                for name, module in layer_map["moe"]:
+                    module._moe_kernel_config = moe_config
+                    module._accelerator_arch = arch
+                    module._uses_triton_moe = True
+
+                moe_configured = len(layer_map["moe"])
+                if moe_configured > 0:
+                    applied_phases.append("moe_kernels")
+                    logger.info(
+                        f"Phase 5 — MoE kernels configured: {moe_configured} layers, "
+                        f"arch={arch}, tma={tma_ok}, wgmma={wgmma_ok}"
+                    )
+                else:
+                    logger.info("Phase 5 — No MoE layers detected, skipping MoE kernels")
+            except Exception as e:
+                logger.warning(f"Phase 5 — MoE kernel configuration failed: {e}")
+
+        # ═════════════════════════════════════════════════════════════════════
+        # Phase 6: FP8 Quantization (Hopper+ SM90+)
+        #   Uses duck-typed layer_map["linear"] — catches ALL nn.Linear.
+        #   — FP8 E4M3 for forward, E5M2 for backward (gradients)
+        #   — FP8ScaleManager for dynamic scale tracking
+        # ═════════════════════════════════════════════════════════════════════
+        if fp8_ok and triton_ok:
+            try:
+                from data_pipeline.trainer.kernels import (
+                    FP8Config,
+                    FP8Format,
+                    FP8ScaleManager,
+                )
+                fp8_cfg = FP8Config()
+                fp8_layers = 0
+
+                for name, module in layer_map["linear"]:
+                    if not getattr(module, '_fp8_enabled', False):
+                        module._fp8_config = fp8_cfg
+                        module._fp8_format_fwd = FP8Format.E4M3
+                        module._fp8_format_bwd = FP8Format.E5M2
+                        module._fp8_enabled = True
+                        module._fp8_scale_manager = FP8ScaleManager(config=fp8_cfg)
+                        fp8_layers += 1
+
+                if fp8_layers > 0:
+                    applied_phases.append("fp8_quantization")
+                    logger.info(f"Phase 6 — FP8 quantization enabled: {fp8_layers} Linear layers")
+            except Exception as e:
+                logger.warning(f"Phase 6 — FP8 quantization failed: {e}")
+
+        # ═════════════════════════════════════════════════════════════════════
+        # Phase 7: Flex Attention Backend Selection
+        #   Uses duck-typed layer_map["attention"] — catches ALL attention.
+        #   — Detects optimal backend: Flash 3 → Flash 2 → Triton → SDPA
+        #   — Configures sliding window / causal masks
+        # ═════════════════════════════════════════════════════════════════════
+        if kernel_cfg.use_flash_attention and (flash_ok or triton_ok):
+            try:
+                from data_pipeline.trainer.kernels import (
+                    FlexAttentionConfig,
+                    AttentionBackend,
+                    BackendCapabilities,
+                )
+                backend_caps = BackendCapabilities()
+                attn_configured = 0
+
+                for name, module in layer_map["attention"]:
+                    # Build FlexAttentionConfig if PrecisionMode is available
+                    flex_cfg = None
+                    if hasattr(FlexAttentionConfig, 'PrecisionMode'):
+                        precision = (
+                            FlexAttentionConfig.PrecisionMode.FP8 if fp8_ok
+                            else FlexAttentionConfig.PrecisionMode.BF16 if bf16_ok
+                            else FlexAttentionConfig.PrecisionMode.FP16
+                        )
+                        flex_cfg = FlexAttentionConfig(
+                            causal=True,
+                            precision=precision,
+                        )
+
+                    if flex_cfg is not None:
+                        optimal_backend = backend_caps.select_optimal_backend(flex_cfg)
+                        module._flex_attention_backend = optimal_backend
+                    else:
+                        # Fallback: directly determine backend from caps
+                        if flash_ok:
+                            module._flex_attention_backend = AttentionBackend.FLASH_ATTENTION
+                        elif triton_ok:
+                            module._flex_attention_backend = AttentionBackend.TRITON_FUSED
+                        else:
+                            module._flex_attention_backend = AttentionBackend.SDPA_NATIVE
+
+                    module._flex_attention_configured = True
+                    attn_configured += 1
+
+                if attn_configured > 0:
+                    applied_phases.append("flex_attention")
+                    logger.info(
+                        f"Phase 7 — Flex Attention configured: {attn_configured} attention layers"
+                    )
+            except Exception as e:
+                logger.warning(f"Phase 7 — Flex Attention configuration failed: {e}")
+
+        # ═════════════════════════════════════════════════════════════════════
+        # Phase 8: Model Compilation (torch.compile)
+        #   — Uses CompilationConfig with optimal backend selection
+        #   — Inductor config for Triton code-gen tuning
+        #   — Mode: reduce-overhead (default) / max-autotune / default
+        # ═════════════════════════════════════════════════════════════════════
+        if hw_cfg.compile_model and cuda_ok:
+            try:
+                from data_pipeline.trainer.kernels import (
+                    compile_model,
+                    CompilationMode,
+                )
+                compile_mode_map = {
+                    "reduce-overhead": CompilationMode.REDUCE_OVERHEAD
+                    if hasattr(CompilationMode, 'REDUCE_OVERHEAD')
+                    else "reduce-overhead",
+                    "max-autotune": CompilationMode.MAX_AUTOTUNE
+                    if hasattr(CompilationMode, 'MAX_AUTOTUNE')
+                    else "max-autotune",
+                    "default": CompilationMode.DEFAULT
+                    if hasattr(CompilationMode, 'DEFAULT')
+                    else "default",
+                }
+                mode = compile_mode_map.get(
+                    hw_cfg.compile_mode,
+                    hw_cfg.compile_mode,
+                )
+                model = compile_model(model, mode=mode)
+                applied_phases.append("compilation")
+                logger.info(f"Phase 8 — Model compiled with mode={hw_cfg.compile_mode}")
+            except Exception as e:
+                logger.warning(f"Phase 8 — Model compilation failed: {e}")
+
+        # ═════════════════════════════════════════════════════════════════════
+        # Phase 9: Distributed Kernel Initialization
+        #   — DistributedKernels for fused all-reduce & bucketed comms
+        #   — GradientCompressor setup (PowerSGD / FP16 / TopK)
+        #   — Pinned memory transfer for host↔device overlap
+        # ═════════════════════════════════════════════════════════════════════
+        if dist_cfg.enabled and cuda_ok:
+            try:
+                from data_pipeline.trainer.kernels import (
+                    DistributedKernels,
+                    DistributedConfig as KernelDistConfig,
+                    DistributedBackend,
+                )
+                backend_val = None
+                if hasattr(DistributedBackend, dist_cfg.backend.upper()):
+                    backend_val = DistributedBackend(dist_cfg.backend)
+
+                dist_kernel_config = KernelDistConfig(
+                    backend=backend_val,
+                )
+                self._distributed_kernels = DistributedKernels(config=dist_kernel_config)
+                applied_phases.append("distributed_kernels")
+                logger.info("Phase 9 — Distributed kernels initialized")
+            except Exception as e:
+                logger.warning(f"Phase 9 — Distributed kernels failed: {e}")
+
+        # ═════════════════════════════════════════════════════════════════════
+        # Phase 10: Summary Report
+        # ═════════════════════════════════════════════════════════════════════
+        self._kernel_optimization_phases = applied_phases
+        self._kernel_capabilities = capabilities
+
+        if applied_phases:
+            logger.info(
+                f"✓ SOTA Kernel Optimizations applied ({len(applied_phases)}/10 phases): "
+                f"{', '.join(applied_phases)}"
+            )
+        else:
+            logger.warning("⚠ No kernel optimizations could be applied")
+
         return model
     
     # ═════════════════════════════════════════════════════════════════════════════
