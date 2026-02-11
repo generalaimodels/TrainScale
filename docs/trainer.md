@@ -1,78 +1,76 @@
-# Trainer Module Documentation
+# SOTA Unified Trainer Documentation
 
-The `trainer` module provides an **Above-SOTA** training infrastructure designed for scalability, mixed precision, and ease of use. It abstracts the complexities of the training loop while exposing full control via callbacks and configuration.
+The `trainer` module provides an **Above-Unsloth** training infrastructure designed for extreme performance, scalability, and ease of use. It unifies Full Finetuning, LoRA/QLoRA, FP8, and RL into a single engine.
 
-## 1. SOTA Trainer (`trainer/base.py`)
+## 1. SOTA Trainer (`trainer/trainers/sota_trainer.py`)
 
-The `Trainer` class is the central engine. It supports:
-- **Mixed Precision**: Automatic FP16/BF16 scaling.
-- **Gradient Accumulation**: Simulate large batch sizes.
-- **Distributed Training**: Native DDP/FSDP integration.
-- **Profiling**: Integrated throughput and loss monitoring.
+The `SOTATrainer` class is the central engine. It exceeds standard trainers by integrating:
+
+- **All Training Modes**: Full Finetuning, LoRA, QLoRA, FP8, Pretraining.
+- **Advanced RL**: GRPO, GSPO, DrGRPO, DAPO (80% VRAM reduction), PPO, DPO, ORPO.
+- **Triton Kernels**: Manual backprop (0% accuracy loss), Flash Attention, Fused RoPE/RMSNorm.
+- **Distributed**: Native SOTA DDP and FSDP2 integration.
+- **Export**: Auto-export to GGUF (q4/q5/q8), vLLM, SGLang, and HuggingFace.
 
 ### Usage
 
 ```python
-from data_pipeline.trainer import Trainer, load_training_config
+from data_pipeline.trainer.core.sota_config import SOTAConfig
+from data_pipeline.trainer.trainers.sota_trainer import SOTATrainer
 
-args = load_training_config("train_config.yaml")
+# 1. Load configuration (YAML or Presets)
+config = SOTAConfig.from_yaml("sota_config.yaml")
 
-trainer = Trainer(
-    model=my_model,
-    args=args,
-    train_dataset=train_ds,
-    eval_dataset=eval_ds
-)
+# 2. Initialize Trainer
+trainer = SOTATrainer(config)
 
-# Start training
+# 3. Setup Model (applies LoRA/Quantization/Kernels)
+trainer.setup_model()
+
+# 4. Train
 output = trainer.train()
+
+# 5. Export
+trainer.export()
 ```
 
 ---
 
-## 2. Configuration (`trainer/training_config.py`)
+## 2. Configuration (`trainer/core/sota_config.py`)
 
-The `TrainingConfig` dataclass manages strict typing for all hyperparameters.
+The `SOTAConfig` dataclass is the single source of truth, typically loaded from YAML.
 
-### Key Parameters
-- `training_mode`: `FULL_FINETUNE`, `QLORA`, `PRETRAINING`.
-- `precision`: `bf16`, `fp16`, `tf32`.
-- `optimizer`: `adamw_8bit` (bitsandbytes), `lion`, `sophia`.
-- `scheduler`: `cosine_with_restarts`, `linear`.
+### Key Sections
+- **`training_mode`**: `full`, `lora`, `qlora`, `pretrain`, `rl`.
+- **`hardware`**: Precision (`bf16`, `fp16`, `fp8`), device (`auto`, `cuda`, `rocm`).
+- **`lora`**: Rank, Alpha, Target Modules (`gate_proj`, `up_proj`, etc.).
+- **`rl`**: Algorithm (`grpo`, `dapo`), Group Size, Generations.
+- **`kernels`**: Enable/disable Triton optimizations.
 
 ### Presets
 
-Helper functions to get SOTA defaults:
-- `get_qlora_config(model_name)`: Optimized for QLoRA.
-- `get_pretraining_config(model_name)`: Optimized for throughput.
+Helper functions for instant SOTA configurations:
+
+- `get_qlora_preset(model_name)`: 4-bit NF4 + Double Quant.
+- `get_fp8_preset(model_name)`: H100/L40 optimized FP8 training.
+- `get_rl_grpo_preset(model_name)`: DeepSeek-style GRPO RL.
+- `get_dpo_preset(model_name)`: Direct Preference Optimization.
 
 ---
 
-## 3. Callbacks System (`trainer/callbacks/`)
+## 3. Distributed Training (`trainer/distributed/`)
 
-The trainer is highly extensible via the `Callback` interface.
+The trainer automatically handles distributed setups with enhanced wrappers:
 
-### Built-in Callbacks
-- `ProgressCallback`: TQDM progress bars.
-- `LoggingCallback`: TensorBoard/WandB logging.
-- `CheckpointCallback`: Model saving with rotation (keep last N).
-- `EarlyStoppingCallback`: Stop based on metric improvement.
-
-### Custom Callback
-
-```python
-class MyCallback(Callback):
-    def on_step_end(self, ctx: CallbackContext):
-        if ctx.loss < 0.1:
-            print("Loss is low!")
-```
+- **SOTA DDP**: Optimized with `static_graph=True` and gradient bucketing.
+- **SOTA FSDP2**: config-driven Fully Sharded Data Parallel with mixed precision policies.
+- **Context Parallel**: For ultra-long sequence training.
 
 ---
 
-## 4. Distributed Training (`trainer/distributed/`)
+## 4. Kernels & Optimization (`trainer/kernels/`)
 
-Auto-detects the environment (Torchrun, SLURM, MPI) and configures the process group.
-
-- **`DeviceManager`**: Handles GPU/TPU/MPS selection.
-- **`GradientSynchronizer`**: Manages all-reduce operations.
-- **`FSDP Integration`**: Zero-config Fully Sharded Data Parallel.
+Automatically detects hardware and enables:
+- **LCE**: Loss-Compute-Enable manual backprop for memory savings.
+- **Fused Operators**: CrossEntropy, RMSNorm, RoPE, SwiGLU.
+- **Quantization**: 4-bit / 8-bit / FP8 loading and training.
