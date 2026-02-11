@@ -909,6 +909,7 @@ class DistributedState:
                 timeout=timedelta(minutes=timeout_minutes),
                 rank=state.rank,
                 world_size=state.world_size,
+                device_id=state.device if selected_backend == "nccl" else None,
             )
             
             state.phase = StatePhase.READY
@@ -1133,8 +1134,8 @@ def _configure_nccl_environment(topology: HardwareTopology) -> None:
     # Use tree algorithms for allreduce (better for large messages)
     os.environ.setdefault("NCCL_ALGO", "Tree")
     
-    # Enable async error handling
-    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
+    # Enable async error handling (use TORCH_ prefix to avoid deprecation warning)
+    os.environ.setdefault("TORCH_NCCL_ASYNC_ERROR_HANDLING", "1")
     
     # Set buffer size for optimal throughput
     os.environ.setdefault("NCCL_BUFFSIZE", str(16 * 1024 * 1024))  # 16MB

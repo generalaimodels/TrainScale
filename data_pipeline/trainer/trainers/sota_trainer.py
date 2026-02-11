@@ -34,7 +34,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch import Tensor
-from torch import Tensor
+
 from torch.utils.data import DataLoader, Dataset
 import torch.distributed as dist
 
@@ -84,6 +84,13 @@ from data_pipeline.trainer.core.sota_config import (
     LossType,
     RLAlgorithm,
     ExportFormat,
+)
+
+from data_pipeline.trainer.core.types import (
+    LoggingConfig,
+    LoggingBackend,
+    CheckpointConfig,
+    CheckpointStrategy,
 )
 
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -365,18 +372,28 @@ class SOTATrainer:
         train_cfg = self.config.training
         
         # Add logging callback
-        self.callback_handler.add_callback(LoggingCallback(
-            log_interval=getattr(train_cfg, 'logging_steps', 100)
-        ))
+        log_steps = getattr(train_cfg, 'logging_steps', 100)
+        # Create default logging config
+        logging_config = LoggingConfig(
+            backends=[LoggingBackend.CONSOLE],
+            log_steps=log_steps,
+            log_dir=getattr(train_cfg, 'logging_dir', 'logs'),
+        )
+        self.callback_handler.add_callback(LoggingCallback(config=logging_config))
         
         # Add progress callback
         self.callback_handler.add_callback(ProgressCallback())
         
         # Add checkpoint callback if configured
         if hasattr(train_cfg, 'save_steps') and train_cfg.save_steps > 0:
+            ckpt_config = CheckpointConfig(
+                strategy=CheckpointStrategy.STEPS,
+                save_steps=train_cfg.save_steps,
+                save_total_limit=getattr(train_cfg, 'save_total_limit', 3),
+            )
             self.callback_handler.add_callback(CheckpointCallback(
                 save_dir=getattr(train_cfg, 'output_dir', './checkpoints'),
-                save_steps=train_cfg.save_steps,
+                config=ckpt_config,
             ))
         
         # Add early stopping if configured
@@ -388,50 +405,32 @@ class SOTATrainer:
     
     def _setup_metrics(self) -> None:
         """Setup training metrics from metrics sub-module."""
-        # Initialize individual trackers for granular control
-        self.loss_tracker = LossTracker(
-            ema_alpha=0.99,
-            window_size=100,
-        )
-        
-        self.throughput_tracker = ThroughputTracker(
-            window_size=100,
-        )
-        
-        self.gradient_tracker = GradientTracker(
-            track_per_layer=getattr(self.config, 'track_gradient_per_layer', False),
-        )
-        
-        # Create unified training metrics if available
         try:
+            # Create unified metrics first
             self.training_metrics = create_training_metrics(
-                loss_tracker=self.loss_tracker,
-                throughput_tracker=self.throughput_tracker,
-                gradient_tracker=self.gradient_tracker,
                 distributed=metrics_is_distributed(),
+                model=self.model,
             )
+            # Alias sub-trackers for convenience
+            self.loss_tracker = self.training_metrics.loss
+            self.throughput_tracker = self.training_metrics.throughput
+            self.gradient_tracker = self.training_metrics.gradient
+            
         except Exception as e:
             logger.warning(f"Could not create unified TrainingMetrics: {e}")
             self.training_metrics = None
-    
+            # Fallback initialization (manual)
+            self.loss_tracker = LossTracker(ema_decay=0.99)
+            self.throughput_tracker = ThroughputTracker()
+            self.gradient_tracker = GradientTracker()
+
     def _setup_hub(self) -> None:
         """Setup hub integration from hub sub-module."""
         export_cfg = self.config.export
         train_cfg = self.config.training
         
-        # Initialize checkpoint manager
-        checkpoint_dir = getattr(train_cfg, 'output_dir', './checkpoints')
-        max_checkpoints = getattr(train_cfg, 'save_total_limit', 3)
-        
-        try:
-            self.checkpoint_manager = CheckpointManager(
-                checkpoint_dir=Path(checkpoint_dir),
-                max_checkpoints=max_checkpoints,
-            )
-        except Exception as e:
-            logger.warning(f"Could not initialize CheckpointManager: {e}")
-        
-        # Initialize hub manager for push operations
+        # Initialize HubManager first (dependency for CheckpointManager)
+        self.hub_manager = None
         if hasattr(export_cfg, 'push_to_hub') and export_cfg.push_to_hub:
             try:
                 hub_config = HubConfig(
@@ -442,6 +441,20 @@ class SOTATrainer:
                 self.hub_manager = HubManager(config=hub_config)
             except Exception as e:
                 logger.warning(f"Could not initialize HubManager: {e}")
+        
+        # Initialize CheckpointManager
+        checkpoint_dir = getattr(train_cfg, 'output_dir', './checkpoints')
+        max_checkpoints = getattr(train_cfg, 'save_total_limit', 3)
+        
+        try:
+            self.checkpoint_manager = CheckpointManager(
+                save_dir=Path(checkpoint_dir),
+                hub_manager=self.hub_manager,
+                max_checkpoints=max_checkpoints,
+            )
+        except Exception as e:
+            logger.warning(f"Could not initialize CheckpointManager: {e}")
+            self.checkpoint_manager = None
         
         # Initialize model serializer
         self.model_serializer = ModelSerializer(
@@ -565,6 +578,10 @@ class SOTATrainer:
             }
             # Allow legacy ddp_config dict to override
             ddp_params.update(dist_cfg.ddp_config)
+            
+            # Explicitly pass Triton configuration if not set in ddp_config
+            if hasattr(self.config, "kernels") and "use_triton_kernels" not in ddp_params:
+                ddp_params["use_triton_kernels"] = self.config.kernels.use_triton
             
             try:
                 self.model = create_ddp_engine(**ddp_params).unwrap().wrap_model(self.model)
@@ -923,6 +940,47 @@ class SOTATrainer:
             return True
         return False
 
+    @staticmethod
+    def _check_model_stability(model: nn.Module) -> None:
+        """
+        Perform numerical stability and hardware quality checks.
+        
+        Inspects:
+          - Dtype consistency (ensures no mixed float32/float16 unless intended)
+          - Weight sanity (checks for NaNs/Infs in initialization)
+          - Hardware constraints (warns if precision > hardware capability)
+        """
+        try:
+            # 1. Dtype Inspection
+            dtypes = {}
+            for name, param in model.named_parameters():
+                dtype = str(param.dtype)
+                dtypes[dtype] = dtypes.get(dtype, 0) + 1
+            
+            logger.info(f"Model Stability Check — Dtype Distribution: {dtypes}")
+            
+            if 'torch.float32' in dtypes and ('torch.float16' in dtypes or 'torch.bfloat16' in dtypes):
+                logger.warning("⚠ Mixed dtypes detected in model parameters (float32 + float16/bf16). "
+                               "Ensure this is intended (e.g. for norms/logits).")
+
+            # 2. Weight Sanity Check (Sampled)
+            has_nan = False
+            has_inf = False
+            for i, (name, param) in enumerate(model.named_parameters()):
+                if i > 5: break  # Check first few layers only to save time
+                if torch.isnan(param).any():
+                    has_nan = True
+                    logger.error(f"❌ NaN detected in weights: {name}")
+                if torch.isinf(param).any():
+                    has_inf = True
+                    logger.error(f"❌ Inf detected in weights: {name}")
+            
+            if not has_nan and not has_inf:
+                logger.info("✓ Weight sanity check passed (no NaNs/Infs in sampled layers)")
+                
+        except Exception as e:
+            logger.warning(f"Stability check failed: {e}")
+
     def _apply_kernel_optimizations(self, model: nn.Module) -> nn.Module:
         """
         Apply comprehensive SOTA kernel optimizations with lazy loading.
@@ -958,6 +1016,11 @@ class SOTATrainer:
         hw_cfg = self.config.hardware
         dist_cfg = self.config.distributed
 
+        # ═════════════════════════════════════════════════════════════════════
+        # Phase 0: Pre-optimization Stability Check
+        # ═════════════════════════════════════════════════════════════════════
+        self._check_model_stability(model)
+
         if not kernel_cfg.use_triton:
             logger.info("Triton kernels disabled in config — skipping kernel optimizations")
             return model
@@ -965,6 +1028,13 @@ class SOTATrainer:
         # ═════════════════════════════════════════════════════════════════════
         # Phase 1: Hardware Capability Detection
         # ═════════════════════════════════════════════════════════════════════
+        logger.info(f"DEBUG: kernel_cfg state: triton={kernel_cfg.use_triton}, "
+                    f"flash={kernel_cfg.use_flash_attention}, "
+                    f"rope={kernel_cfg.use_fused_rope}, "
+                    f"rms={kernel_cfg.use_fused_rms_norm}, "
+                    f"ce={kernel_cfg.use_fused_cross_entropy}, "
+                    f"lora={kernel_cfg.use_fused_lora}")
+
         capabilities = get_kernel_capabilities()
 
         triton_ok = capabilities.get("triton", False)
@@ -1189,7 +1259,8 @@ class SOTATrainer:
         #   — FP8 E4M3 for forward, E5M2 for backward (gradients)
         #   — FP8ScaleManager for dynamic scale tracking
         # ═════════════════════════════════════════════════════════════════════
-        if fp8_ok and triton_ok:
+        # ═════════════════════════════════════════════════════════════════════
+        if fp8_ok and triton_ok and self.config.quantization.load_in_fp8:
             try:
                 from data_pipeline.trainer.kernels import (
                     FP8Config,

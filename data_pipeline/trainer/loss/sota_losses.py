@@ -42,7 +42,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.cuda.amp import custom_bwd, custom_fwd
+
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -446,7 +446,7 @@ class FusedCrossEntropyFunction(torch.autograd.Function):
     """
     
     @staticmethod
-    @custom_fwd
+    @torch.amp.custom_fwd(device_type='cuda')
     def forward(
         ctx,
         logits: Tensor,
@@ -495,7 +495,7 @@ class FusedCrossEntropyFunction(torch.autograd.Function):
             return loss
     
     @staticmethod
-    @custom_bwd
+    @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, grad_output: Tensor) -> Tuple[Optional[Tensor], ...]:
         logits, labels, lse = ctx.saved_tensors
         N, V = ctx.N, ctx.V

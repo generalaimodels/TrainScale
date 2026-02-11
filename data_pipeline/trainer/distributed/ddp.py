@@ -24,7 +24,7 @@
 # Version: 2.0.0
 # ════════════════════════════════════════════════════════════════════════════════════════════════════════
 
-from __future__ import annotations
+
 
 import functools
 import logging
@@ -918,7 +918,7 @@ class GradientCompressionHook(ABC):
     AllReduce and optionally compress/decompress.
     """
     
-    __slots__ = ("_process_group", "_world_size", "_rank", "_metrics", "_device")
+    __slots__ = ("_process_group", "_world_size", "_rank", "_metrics", "_device", "__name__", "__qualname__")
     
     def __init__(self, process_group: Optional[dist.ProcessGroup] = None):
         """
@@ -941,7 +941,7 @@ class GradientCompressionHook(ABC):
     def __call__(
         self,
         state: Any,
-        bucket: GradBucket,
+        bucket: dist.GradBucket,
     ) -> torch.futures.Future[Tensor]:
         """
         Process gradient bucket.
@@ -1033,7 +1033,7 @@ class FP16CompressionHook(GradientCompressionHook):
     def __call__(
         self,
         state: Any,
-        bucket: GradBucket,
+        bucket: dist.GradBucket,
     ) -> torch.futures.Future[Tensor]:
         """Compress, AllReduce, and decompress gradient bucket."""
         tensor = bucket.buffer()
@@ -1173,7 +1173,7 @@ class PowerSGDHook(GradientCompressionHook):
     def __call__(
         self,
         state: Any,
-        bucket: GradBucket,
+        bucket: dist.GradBucket,
     ) -> torch.futures.Future[Tensor]:
         """Process gradient bucket with PowerSGD compression."""
         self._step += 1
@@ -1296,7 +1296,7 @@ class TopKSparsificationHook(GradientCompressionHook):
     def __call__(
         self,
         state: Any,
-        bucket: GradBucket,
+        bucket: dist.GradBucket,
     ) -> torch.futures.Future[Tensor]:
         """Process gradient bucket with TopK sparsification."""
         tensor = bucket.buffer()

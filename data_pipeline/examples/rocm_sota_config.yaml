@@ -84,7 +84,7 @@ dataset:
     train:
       name: "train_sft"
       alias: "training"
-      sample_size: 10000 # Start with 100 for rapid demo testing
+      sample_size: 10000 # 10K samples for valid epoch statistics
       shuffle: true
       seed: 42
     validation:
@@ -183,7 +183,7 @@ output_schema:
 # ═════════════════════════════════════════════════════════════════════════════════
 dataloader:
   batch_size: 8
-  num_workers: 8
+  num_workers: 0
   pin_memory: true
   drop_last: false
   shuffle: true
@@ -230,7 +230,7 @@ quantization:
 optimizer:
   # SOTA optimizers: lion, came, sophia, prodigy, adam8bit
   type: "adamw"             # Standard AdamW (Most Stable)
-  learning_rate: 2.0e-6     # Safe LR (Reduced from 2e-5)
+  learning_rate: 1.0e-4     # Aggressive LR for stability test
   weight_decay: 0.0         # Minimal decay for stability
   betas: [0.9, 0.999]       # For AdamW
   eps: 1.0e-8
@@ -334,6 +334,7 @@ distributed:
     find_unused_parameters: false
     bucket_cap_mb: 50
     gradient_compression: "fp16"
+    use_triton_kernels: false # Explicitly disable DDP Triton hooks
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # Hardware Configuration - AMD MI300X (ROCm)
@@ -345,7 +346,7 @@ hardware:
   tf32: false               # Not applicable for AMD
   compile_model: false      # torch.compile() - experimental on ROCm
   compile_mode: "reduce-overhead"
-  num_workers: 4
+  num_workers: 0
   pin_memory: true
   prefetch_factor: 2
 
@@ -353,13 +354,13 @@ hardware:
 # Kernel Configuration (Triton-fused ops)
 # ═════════════════════════════════════════════════════════════════════════════════
 kernels:
-  use_triton: true          # Triton supported on ROCm
-  use_flash_attention: true # Flash Attention 2 for ROCm
-  use_fused_rope: true
-  use_fused_rms_norm: true
-  use_fused_cross_entropy: true
-  use_fused_lora: true
-  use_moe_kernels: true
+  use_triton: true           # USP: Enable Triton (for RMSNorm/LoRA)
+  use_flash_attention: false # Disabled (Suspected Crusher)
+  use_fused_rope: false      # Disabled (Suspected Crusher)
+  use_fused_rms_norm: true   # Keep enabled (Low risk)
+  use_fused_cross_entropy: false # Disabled (Suspected Crusher)
+  use_fused_lora: true       # Enable LoRA
+  use_moe_kernels: false     # Disabled (Suspected Crusher)
   autotune: true
   activation_checkpointing: true
   memory_efficient_attention: true
@@ -386,7 +387,7 @@ data:
 # ═════════════════════════════════════════════════════════════════════════════════
 training:
   output_dir: "./outputs/rocm_sota_run"
-  num_train_epochs: 1       # 1 epoch for demo
+  num_train_epochs: 3       # 3 epochs for extended test
   per_device_train_batch_size: 32 # Increased for VRAM utilization
   per_device_eval_batch_size: 8
   gradient_accumulation_steps: 4  # Effective global batch 256
@@ -400,4 +401,4 @@ training:
   resume_from_checkpoint: null
   
   # For demo purposes, limit steps
-  max_steps: 5
+  # max_steps: 5            # Unrestricted steps

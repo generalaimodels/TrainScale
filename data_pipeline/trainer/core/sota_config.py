@@ -477,13 +477,13 @@ class SOTAConfig:
             if cc[0] >= 9:
                 if self.hardware.precision == Precision.BF16:
                     pass  # FP8 optional for H100
-                self.kernels.use_flash_attention = True
+                # self.kernels.use_flash_attention = True # Don't override user config
             
             # A100 - BF16 optimal
             elif cc[0] >= 8:
                 self.hardware.precision = Precision.BF16
                 self.hardware.tf32 = True
-                self.kernels.use_flash_attention = True
+                # self.kernels.use_flash_attention = True # Don't override user config
             
             # V100/T4 - FP16
             elif cc[0] >= 7:

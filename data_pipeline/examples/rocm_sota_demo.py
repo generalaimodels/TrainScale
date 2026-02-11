@@ -573,6 +573,15 @@ class SOTARocmPipeline:
         
         # Apply SOTA patches from registry (Triton kernels)
         logger.info("Checking registry for SOTA patches...")
+        
+        # SOTA: rigorous stability check before patching
+        from data_pipeline.trainer.trainers.sota_trainer import SOTATrainer
+        logger.info("Running SOTA Trainer stability checks...")
+        try:
+            SOTATrainer._check_model_stability(model)
+        except Exception as e:
+            logger.warning(f"Stability check skipped: {e}")
+
         if registry.get_model_info(model_name) or True: # Force check
             registry.patch_model(model)
         

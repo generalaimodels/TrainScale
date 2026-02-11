@@ -33,7 +33,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict,
+from typing import Any, Dict, List, Optional, Tuple
 
 # ═════════════════════════════════════════════════════════════════════════════════
 # Path Setup
@@ -144,23 +144,6 @@ class SOTADDPConfig:
 # SOTA DDP Training Pipeline
 # ═════════════════════════════════════════════════════════════════════════════════
 
-class SOTADDPPipeline:
-    """
-    Complete SOTA DDP pipeline for multi-GPU training.
-    
-    Integrates with TrainScale registry for:
-      - Any registered model
-      - SOTA optimizers (Lion, CAME, Prodigy)
-      - SOTA schedulers (WSD, REX)
-    """
-    
-    def __init__(self, config: SOTADDPConfig):
-        self.config = config
-        
-        # Initialize distributed state from environment
-        self.dist_state = DistributedState.from_environment()
-        
-        # Initialize if not already done
 @dataclass
 class SOTADemo:
     """
