@@ -366,11 +366,16 @@ def _enforce_trainer_device(device: torch.device):
         yield
         return
 
-    torch.cuda.set_device(device)
-    with torch.cuda.device(device):
+    cuda_device = device
+    if cuda_device.index is None:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        cuda_device = torch.device(f"cuda:{local_rank}")
+
+    torch.cuda.set_device(cuda_device)
+    with torch.cuda.device(cuda_device):
         yield
     # Re-pin after scope exit (defensive)
-    torch.cuda.set_device(device)
+    torch.cuda.set_device(cuda_device)
 
 
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -780,7 +785,14 @@ class SOTATrainer:
             else:
                 device = torch.device("cpu")
         else:
-            device = torch.device(hw.device.value)
+            if hw.device.value == "cuda":
+                local_rank = int(
+                    os.environ.get("LOCAL_RANK", hw.device_id),
+                )
+                device = torch.device(f"cuda:{local_rank}")
+                torch.cuda.set_device(device)
+            else:
+                device = torch.device(hw.device.value)
 
         return device
 
@@ -2334,9 +2346,7 @@ class SOTATrainer:
 
         # [INT-009] Gradient norm from FSDP2 metrics
         if self._is_fsdp2_active:
-            grad_norm_val = (
-                self._fsdp2_engine.metrics.current.gradient_norm
-            )
+            grad_norm_val = self._fsdp2_engine.metrics.get_last_gradient_norm()
         elif grad_norm_override is not None:
             grad_norm_val = grad_norm_override
         else:
@@ -2679,12 +2689,12 @@ class SOTATrainer:
             )
             # [TFIX-001] Re-pin device on failure
             if self.device.type == "cuda" and torch.cuda.is_available():
-                torch.cuda.set_device(self.device)
+                torch.cuda.set_device(self._fsdp2_engine.device)
             return
 
         # [TFIX-001] Re-pin device after FSDP2 save
         if self.device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.set_device(self.device)
+            torch.cuda.set_device(self._fsdp2_engine.device)
 
         # [TFIX-002] Save trainer state (NO optimizer — already saved)
         if self._fsdp2_engine.is_rank_zero:
@@ -2697,7 +2707,7 @@ class SOTATrainer:
 
         # [TFIX-001] Final device re-pin
         if self.device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.set_device(self.device)
+            torch.cuda.set_device(self._fsdp2_engine.device)
 
         elapsed = time.monotonic() - save_start
         log_rank_0(

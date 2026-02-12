@@ -1012,6 +1012,14 @@ class MetricsCollector:
             ),
         }
 
+    def get_last_gradient_norm(self) -> float:
+        """Return grad norm from the last recorded step (or current if none)."""
+        with self._lock:
+            self._flush_pending_events()
+            if self._history:
+                return float(self._history[-1].gradient_norm)
+            return float(self._current.gradient_norm)
+
 
 # ════════════════════════════════════════════════════════════════════════════════
 # Gradient Accumulator — Name-Keyed, In-Place, FSDP-Safe
