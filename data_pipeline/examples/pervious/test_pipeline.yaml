@@ -1,0 +1,152 @@
+# ════════════════════════════════════════════════════════════════════════════════
+# Test Pipeline Configuration (Small Sample for Quick Demo)
+# ════════════════════════════════════════════════════════════════════════════════
+type: "data_module"
+version: "2.0"
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Dataset Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+dataset:
+  name: "tatsu-lab/alpaca"
+  config_name: null
+  streaming: false
+
+  # Use small sample for quick testing
+  splits:
+    train:
+      name: "train"
+      alias: "training"
+      sample_size: 100  # Small sample for testing
+      shuffle: true
+      seed: 42
+
+  column_mapping:
+    instruction: "instruction"
+    input: "input"
+    output: "output"
+    text: "text"
+
+  columns: []
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Introspection Settings
+# ═════════════════════════════════════════════════════════════════════════════════
+introspection:
+  enabled: true
+  auto_discover_splits: true
+  auto_discover_columns: true
+  trust_remote_code: false
+  fallback_columns:
+    - "instruction"
+    - "input"
+    - "output"
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Tokenizer Configuration (Use GPT-2 for fast testing)
+# ═════════════════════════════════════════════════════════════════════════════════
+tokenizer:
+  name_or_path: "gpt2"
+  max_length: 512
+  padding: "max_length"
+  truncation: true
+  padding_side: "right"
+  truncation_side: "right"
+  add_special_tokens: true
+  special_tokens: {}
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Prompt Template Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+prompt_template:
+  format_type: "custom"
+  template: |
+    ### Instruction:
+    {{ instruction }}
+    {% if input %}
+    ### Input:
+    {{ input }}
+    {% endif %}
+    ### Response:
+    {{ output }}
+
+  input_columns:
+    - "instruction"
+    - "input"
+  label_column: "output"
+  mask_input: true
+  add_bos: true
+  add_eos: true
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Preprocessing Configuration (SOTA)
+# ═════════════════════════════════════════════════════════════════════════════════
+# All preprocessing is controlled via YAML - no hardcoding!
+# Features: per-column limits, smart truncation, content distribution
+# ═════════════════════════════════════════════════════════════════════════════════
+preprocessing:
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Length Manager: Controls per-column limits and truncation
+  # ─────────────────────────────────────────────────────────────────────────────
+  length_manager:
+    enabled: true  # Enable SOTA length management
+    max_total_length: 512
+    padding_strategy: "longest"    # longest, max_length, do_not_pad, bucket  
+    truncation_strategy: "smart"   # smart, simple, word_boundary, sentence_boundary
+    
+    # Per-column character limits
+    per_column_limits:
+      instruction: 500   # Max chars for instruction
+      input: 300         # Max chars for input  
+      output: 800        # Max chars for output
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Content Distribution: Token-aware allocation across columns
+  # ─────────────────────────────────────────────────────────────────────────────
+  content_distribution:
+    enabled: false  # Disable for speed in testing
+    mode: "proportional"
+    column_ratios:
+      instruction: 0.25
+      input: 0.15
+      output: 0.55
+    special_tokens_budget: 10
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Packing: Combine short sequences (disabled for testing)
+  # ─────────────────────────────────────────────────────────────────────────────
+  packing:
+    enabled: false
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Output Schema
+# ═════════════════════════════════════════════════════════════════════════════════
+output_schema:
+  input_ids:
+    dtype: "long"
+  attention_mask:
+    dtype: "long"
+    pad_value: 0
+  labels:
+    dtype: "long"
+    pad_value: -100
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# DataLoader Configuration
+# ═════════════════════════════════════════════════════════════════════════════════
+dataloader:
+  batch_size: 4
+  num_workers: 0  # Avoid multiprocessing for testing
+  pin_memory: false
+  drop_last: false
+  shuffle: true
+  prefetch_factor: 2
+  persistent_workers: false
+
+# ═════════════════════════════════════════════════════════════════════════════════
+# Training Configuration (Minimal for testing)
+# ═════════════════════════════════════════════════════════════════════════════════
+training:
+  mode: "full"
+  num_epochs: 1
+  seed: 42

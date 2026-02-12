@@ -1,0 +1,112 @@
+# ════════════════════════════════════════════════════════════════════════════════
+# Example Pipeline Configuration
+# ════════════════════════════════════════════════════════════════════════════════
+# YAML-driven data preprocessing configuration for SOTA pipeline
+# Use with: python e2e_batch_demo.py
+# ════════════════════════════════════════════════════════════════════════════════
+
+type: data_module
+version: "1.0"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Dataset Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+dataset:
+  name: "tatsu-lab/alpaca"
+  streaming: false
+  
+  # SOTA: Use 10k samples for meaningful training
+  splits:
+    train:
+      name: "train"
+      sample_size: 10000  # 10k examples for real training
+      shuffle: true
+      seed: 42
+
+  # Column Mapping
+  column_mapping:
+    instruction: "instruction"
+    input: "input"
+    output: "output"
+  
+  columns:
+    - instruction
+    - input
+    - output
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Tokenizer Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+tokenizer:
+  name_or_path: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"  # Match model
+  max_length: 512  # Reduced for T4 GPU memory
+  padding: "longest"
+  truncation: true
+  add_special_tokens: true
+  padding_side: "right"
+  truncation_side: "right"
+  return_tensors: "pt"  # Return PyTorch tensors
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Prompt Template Configuration (Alpaca Format)
+# ─────────────────────────────────────────────────────────────────────────────────
+prompt:
+  format_type: "custom"
+  
+  # Jinja2 template
+  template: |
+    ### Instruction:
+    {{ instruction }}
+    {% if input %}
+    
+    ### Input:
+    {{ input }}
+    {% endif %}
+    
+    ### Response:
+    {{ output }}{{ eos_token }}
+  
+  # Column configuration
+  input_columns:
+    - instruction
+    - input
+  label_column: "output"
+  
+  # Loss masking
+  mask_input: true  # Mask input tokens in labels (-100)
+  
+  # Special token control
+  add_bos: false
+  add_eos: true
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Hardware Configuration (User-Defined - Depends on Hardware)
+# ─────────────────────────────────────────────────────────────────────────────────
+hardware:
+  device: "auto"  # "auto", "cuda", "cpu", "mps"
+  dtype: "float32"  # "float32", "float16", "bfloat16" (depends on hardware)
+  # Note: For A100/H100 use bfloat16, for V100/T4 use float16, for CPU use float32
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Output Schema (Model-Ready Tensors)
+# ─────────────────────────────────────────────────────────────────────────────────
+output_schema:
+  input_ids:
+    dtype: "long"  # Always long for token IDs
+    pad_value: 50256
+  attention_mask:
+    dtype: "long"  # Always long for mask
+    pad_value: 0
+  labels:
+    dtype: "long"  # Always long for labels
+    pad_value: -100
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# DataLoader Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+dataloader:
+  batch_size: 2  # Reduced for T4 GPU (15GB VRAM)
+  shuffle: true
+  num_workers: 2
+  pin_memory: true  # Faster GPU transfer
+  drop_last: true  # Consistent batch sizes

@@ -1,0 +1,95 @@
+# ════════════════════════════════════════════════════════════════════════════════
+# End-to-End Pipeline Configuration
+# ════════════════════════════════════════════════════════════════════════════════
+# Complete YAML config for Alpaca dataset preprocessing
+# ════════════════════════════════════════════════════════════════════════════════
+
+type: data_module
+version: "1.0"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Dataset: Alpaca (Instruction-Following)
+# ─────────────────────────────────────────────────────────────────────────────────
+dataset:
+  name: "tatsu-lab/alpaca"
+  streaming: false
+  
+  splits:
+    train:
+      name: "train"
+      sample_size: 100  # Small sample for demo
+      shuffle: true
+      seed: 42
+  
+  # Column mapping: source -> target
+  column_mapping:
+    instruction: "instruction"
+    input: "input"
+    output: "output"
+  
+  columns:
+    - instruction
+    - input
+    - output
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Tokenizer Configuration
+# ─────────────────────────────────────────────────────────────────────────────────
+tokenizer:
+  name_or_path: "gpt2"
+  max_length: 512
+  padding: "longest"
+  truncation: true
+  add_special_tokens: true
+  padding_side: "right"
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Prompt Template (Alpaca Format)
+# ─────────────────────────────────────────────────────────────────────────────────
+prompt:
+  format_type: "custom"
+  
+  template: |
+    ### Instruction:
+    {{ instruction }}
+    {% if input %}
+    
+    ### Input:
+    {{ input }}
+    {% endif %}
+    
+    ### Response:
+    {{ output }}{{ eos_token }}
+  
+  input_columns:
+    - instruction
+    - input
+  label_column: "output"
+  
+  mask_input: true
+  add_bos: false
+  add_eos: true
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# Output Schema (Loss-Aligned)
+# ─────────────────────────────────────────────────────────────────────────────────
+output_schema:
+  input_ids:
+    dtype: "long"
+    pad_value: 50256  # gpt2 eos_token_id
+  attention_mask:
+    dtype: "long"
+    pad_value: 0
+  labels:
+    dtype: "long"
+    pad_value: -100  # CrossEntropyLoss ignore_index
+
+# ─────────────────────────────────────────────────────────────────────────────────
+# DataLoader Settings
+# ─────────────────────────────────────────────────────────────────────────────────
+dataloader:
+  batch_size: 4
+  shuffle: true
+  num_workers: 0  # Set to 0 for demo (no multiprocessing)
+  pin_memory: false
+  drop_last: false
