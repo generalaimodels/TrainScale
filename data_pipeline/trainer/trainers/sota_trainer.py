@@ -260,6 +260,34 @@ logger = logging.getLogger(__name__)
 _CHECKPOINT_BARRIER_TIMEOUT_S: int = 300
 
 
+# Distributed strategy aliases used across trainer control flow.
+_DISTRIBUTED_STRATEGY_ALIASES: Dict[str, str] = {
+    "fsdp_v2": "fsdp2",
+    "sota_fsdp2": "fsdp2",
+    "zbpp": "pipeline_zbpp",
+}
+
+_DIST_INIT_STRATEGIES = {
+    "ddp",
+    "fsdp",
+    "fsdp2",
+    "sota_fsdp",
+    "pipeline_zbpp",
+    "context_parallel",
+}
+
+
+def _normalize_distributed_strategy(
+    strategy: Optional[str],
+) -> Optional[str]:
+    """Normalize strategy aliases into canonical trainer values."""
+    if strategy is None:
+        return None
+
+    normalized = str(strategy).strip().lower()
+    return _DISTRIBUTED_STRATEGY_ALIASES.get(normalized, normalized)
+
+
 # ═════════════════════════════════════════════════════════════════════════════════
 # Training State
 # ═════════════════════════════════════════════════════════════════════════════════
@@ -334,6 +362,10 @@ def _enforce_trainer_device(device: torch.device):
 
     This is the TRAINER-SIDE complement to FSDP2's _enforce_device_affinity().
     """
+    if device.type != "cuda" or not torch.cuda.is_available():
+        yield
+        return
+
     torch.cuda.set_device(device)
     with torch.cuda.device(device):
         yield
@@ -363,94 +395,236 @@ def _build_fsdp2_config(sota_config: SOTAConfig) -> FSDP2Config:
     train_cfg = sota_config.training
     opt_cfg = sota_config.optimizer
 
+    fsdp_cfg = getattr(dist_cfg, "fsdp_config", {})
+    if not isinstance(fsdp_cfg, dict):
+        fsdp_cfg = {}
+
+    def _resolve(*keys: str, default: Any = None) -> Any:
+        for key in keys:
+            if key in fsdp_cfg and fsdp_cfg[key] is not None:
+                return fsdp_cfg[key]
+        for key in keys:
+            if hasattr(dist_cfg, key):
+                value = getattr(dist_cfg, key)
+                if value is not None:
+                    return value
+        return default
+
     # ── Sharding Strategy ──
     sharding_map = {
+        "full": ShardingStrategy.FULL_SHARD,
         "full_shard": ShardingStrategy.FULL_SHARD,
         "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP,
         "no_shard": ShardingStrategy.NO_SHARD,
         "hybrid_shard": ShardingStrategy.HYBRID_SHARD,
     }
-    fsdp_sharding_str = getattr(
-        dist_cfg, "fsdp_sharding_strategy", "full_shard",
-    )
+    sharding_raw = str(
+        _resolve(
+            "sharding_strategy",
+            "fsdp_sharding_strategy",
+            default="full_shard",
+        ),
+    ).lower()
     sharding = sharding_map.get(
-        fsdp_sharding_str.lower(), ShardingStrategy.FULL_SHARD,
+        sharding_raw,
+        ShardingStrategy.FULL_SHARD,
     )
 
     # ── Mixed Precision ──
-    precision_map = {
-        Precision.BF16: MixedPrecisionPolicy.FULL_BF16,
-        Precision.FP16: MixedPrecisionPolicy.FULL_FP16,
-        Precision.FP32: MixedPrecisionPolicy.PURE_FP32,
-        Precision.FP8_E4M3: MixedPrecisionPolicy.FULL_BF16,
-        Precision.FP8_E5M2: MixedPrecisionPolicy.FULL_BF16,
-    }
-    mixed_prec = precision_map.get(
-        hw_cfg.precision, MixedPrecisionPolicy.FULL_BF16,
-    )
+    mixed_precision_raw = _resolve("mixed_precision", default=None)
+    if isinstance(mixed_precision_raw, MixedPrecisionPolicy):
+        mixed_prec = mixed_precision_raw
+    elif isinstance(mixed_precision_raw, str):
+        mixed_map = {
+            "bf16": MixedPrecisionPolicy.FULL_BF16,
+            "full_bf16": MixedPrecisionPolicy.FULL_BF16,
+            "fp16": MixedPrecisionPolicy.FULL_FP16,
+            "full_fp16": MixedPrecisionPolicy.FULL_FP16,
+            "param_fp32": MixedPrecisionPolicy.PARAM_FP32,
+            "fp32": MixedPrecisionPolicy.PURE_FP32,
+            "pure_fp32": MixedPrecisionPolicy.PURE_FP32,
+        }
+        mixed_prec = mixed_map.get(
+            mixed_precision_raw.lower(),
+            MixedPrecisionPolicy.FULL_BF16,
+        )
+    else:
+        precision_map = {
+            Precision.BF16: MixedPrecisionPolicy.FULL_BF16,
+            Precision.FP16: MixedPrecisionPolicy.FULL_FP16,
+            Precision.FP32: MixedPrecisionPolicy.PURE_FP32,
+            Precision.FP8_E4M3: MixedPrecisionPolicy.FULL_BF16,
+            Precision.FP8_E5M2: MixedPrecisionPolicy.FULL_BF16,
+        }
+        mixed_prec = precision_map.get(
+            hw_cfg.precision, MixedPrecisionPolicy.FULL_BF16,
+        )
 
     # ── Backward Prefetch ──
-    prefetch_map = {
-        "backward_pre": BackwardPrefetchMode.BACKWARD_PRE,
-        "backward_post": BackwardPrefetchMode.BACKWARD_POST,
-        "none": BackwardPrefetchMode.NONE,
-    }
-    prefetch_str = getattr(
-        dist_cfg, "fsdp_backward_prefetch", "backward_pre",
+    prefetch_raw = _resolve(
+        "backward_prefetch",
+        "fsdp_backward_prefetch",
+        default="backward_pre",
     )
-    backward_prefetch = prefetch_map.get(
-        prefetch_str.lower(), BackwardPrefetchMode.BACKWARD_PRE,
-    )
+    if isinstance(prefetch_raw, BackwardPrefetchMode):
+        backward_prefetch = prefetch_raw
+    elif isinstance(prefetch_raw, bool):
+        backward_prefetch = (
+            BackwardPrefetchMode.BACKWARD_PRE
+            if prefetch_raw
+            else BackwardPrefetchMode.NONE
+        )
+    else:
+        prefetch_map = {
+            "backward_pre": BackwardPrefetchMode.BACKWARD_PRE,
+            "backward_post": BackwardPrefetchMode.BACKWARD_POST,
+            "none": BackwardPrefetchMode.NONE,
+            "false": BackwardPrefetchMode.NONE,
+            "off": BackwardPrefetchMode.NONE,
+        }
+        backward_prefetch = prefetch_map.get(
+            str(prefetch_raw).lower(),
+            BackwardPrefetchMode.BACKWARD_PRE,
+        )
 
-    # ── CPU Offload ──
-    offload = OffloadStrategy.NONE
-    if getattr(dist_cfg, "fsdp_cpu_offload", False):
+    # ── Offload Strategy ──
+    offload_raw = _resolve("offload_strategy", default=None)
+    cpu_offload = bool(
+        _resolve("cpu_offload", "fsdp_cpu_offload", default=False),
+    )
+    if isinstance(offload_raw, OffloadStrategy):
+        offload = offload_raw
+    else:
+        offload_map = {
+            "none": OffloadStrategy.NONE,
+            "off": OffloadStrategy.NONE,
+            "false": OffloadStrategy.NONE,
+            "params": OffloadStrategy.CPU_PARAMS,
+            "cpu_params": OffloadStrategy.CPU_PARAMS,
+            "optim": OffloadStrategy.CPU_OPTIM,
+            "cpu_optim": OffloadStrategy.CPU_OPTIM,
+            "cpu": OffloadStrategy.CPU_FULL,
+            "full": OffloadStrategy.CPU_FULL,
+            "cpu_full": OffloadStrategy.CPU_FULL,
+            "nvme": OffloadStrategy.NVME,
+        }
+        offload = offload_map.get(
+            str(offload_raw).lower() if offload_raw is not None else "none",
+            OffloadStrategy.NONE,
+        )
+    if cpu_offload and offload == OffloadStrategy.NONE:
         offload = OffloadStrategy.CPU_FULL
 
     # ── Activation Checkpointing ──
-    ac_enabled = getattr(dist_cfg, "gradient_checkpointing", False)
-    ac_mode = getattr(dist_cfg, "ac_mode", "selective")
-    ac_freq = getattr(dist_cfg, "ac_frequency", 2)
+    ac_enabled = bool(
+        _resolve(
+            "activation_checkpointing",
+            "gradient_checkpointing",
+            default=getattr(dist_cfg, "gradient_checkpointing", False),
+        ),
+    )
+    ac_mode = str(_resolve("ac_mode", default="selective")).lower()
+    if ac_mode not in ("full", "selective", "offload"):
+        ac_mode = "selective"
+    ac_freq = max(1, int(_resolve("ac_frequency", default=2)))
 
     # ── Gradient Accumulation [INT-008] ──
-    grad_accum = getattr(train_cfg, "gradient_accumulation_steps", 1)
+    grad_accum = max(
+        1,
+        int(
+            _resolve(
+                "gradient_accumulation_steps",
+                default=getattr(
+                    train_cfg, "gradient_accumulation_steps", 1,
+                ),
+            ),
+        ),
+    )
 
     # ── Gradient Clipping [INT-008] ──
-    grad_clip = getattr(opt_cfg, "max_grad_norm", 1.0)
+    grad_clip_raw = _resolve(
+        "gradient_clipping_norm",
+        default=getattr(opt_cfg, "max_grad_norm", 1.0),
+    )
+    try:
+        grad_clip = float(grad_clip_raw)
+    except (TypeError, ValueError):
+        grad_clip = float(getattr(opt_cfg, "max_grad_norm", 1.0))
     if grad_clip <= 0:
         grad_clip = None
 
     # ── use_orig_params (required for torch.compile + FSDP) ──
-    use_orig = getattr(dist_cfg, "fsdp_use_orig_params", True)
+    use_orig = bool(
+        _resolve("use_orig_params", "fsdp_use_orig_params", default=True),
+    )
     if hw_cfg.compile_model:
         use_orig = True
 
     # ── Triton ──
-    use_triton = True
-    if hasattr(sota_config, "kernels"):
-        use_triton = sota_config.kernels.use_triton
+    use_triton = _resolve("use_triton_kernels", default=None)
+    if use_triton is None:
+        use_triton = (
+            sota_config.kernels.use_triton
+            if hasattr(sota_config, "kernels")
+            else True
+        )
+
+    bucket_size_mb = max(
+        1,
+        int(
+            _resolve(
+                "bucket_size_mb",
+                "fsdp_bucket_size_mb",
+                default=25,
+            ),
+        ),
+    )
 
     return FSDP2Config(
         sharding_strategy=sharding,
         mixed_precision=mixed_prec,
         offload_strategy=offload,
         use_orig_params=use_orig,
-        forward_prefetch=getattr(dist_cfg, "fsdp_forward_prefetch", True),
-        backward_prefetch=backward_prefetch,
-        limit_all_gathers=getattr(
-            dist_cfg, "fsdp_limit_all_gathers", True,
+        forward_prefetch=bool(
+            _resolve(
+                "forward_prefetch",
+                "fsdp_forward_prefetch",
+                default=True,
+            ),
         ),
-        use_triton_kernels=use_triton,
-        bucket_size_mb=getattr(dist_cfg, "fsdp_bucket_size_mb", 25),
-        sync_module_states=True,
+        backward_prefetch=backward_prefetch,
+        limit_all_gathers=bool(
+            _resolve(
+                "limit_all_gathers",
+                "fsdp_limit_all_gathers",
+                default=True,
+            ),
+        ),
+        use_triton_kernels=bool(use_triton),
+        bucket_size_mb=bucket_size_mb,
+        sync_module_states=bool(
+            _resolve("sync_module_states", default=True),
+        ),
         activation_checkpointing=ac_enabled,
         ac_mode=ac_mode,
         ac_frequency=ac_freq,
         gradient_accumulation_steps=grad_accum,
         gradient_clipping_norm=grad_clip,
-        use_memory_pool=True,
-        deterministic=getattr(train_cfg, "deterministic", False),
-        debug_mode=getattr(train_cfg, "debug_mode", False),
+        use_memory_pool=bool(
+            _resolve("use_memory_pool", default=True),
+        ),
+        deterministic=bool(
+            _resolve(
+                "deterministic",
+                default=getattr(train_cfg, "deterministic", False),
+            ),
+        ),
+        debug_mode=bool(
+            _resolve(
+                "debug_mode",
+                default=getattr(train_cfg, "debug_mode", False),
+            ),
+        ),
     )
 
 
@@ -508,15 +682,35 @@ class SOTATrainer:
         self.kernel_capabilities = get_kernel_capabilities()
 
         # Distributed Initialization
-        self.distributed_strategy = (
+        self.distributed_enabled = bool(
+            getattr(config.distributed, "enabled", False),
+        )
+        raw_strategy = (
             config.distributed.strategy
             if hasattr(config.distributed, "strategy")
             else None
         )
-        if self.distributed_strategy in (
-            "ddp", "fsdp", "fsdp2", "sota_fsdp",
+        self.distributed_strategy = _normalize_distributed_strategy(
+            raw_strategy,
+        )
+
+        if not self.distributed_enabled:
+            self.distributed_strategy = None
+
+        env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        if (
+            self.distributed_enabled
+            and self.distributed_strategy in _DIST_INIT_STRATEGIES
+            and env_world_size > 1
+            and not dist.is_initialized()
         ):
-            DDPInitializer.init_process_group()
+            init_result = DDPInitializer.init_process_group(
+                backend=getattr(config.distributed, "backend", "nccl"),
+            )
+            if init_result.is_err():
+                raise RuntimeError(
+                    f"Distributed init failed: {init_result.error}"
+                )
             log_rank_0(
                 f"Initialized distributed: {self.distributed_strategy}"
             )
@@ -597,23 +791,35 @@ class SOTATrainer:
         """
         precision = self.config.hardware.precision
 
+        amp_device = "cuda" if self.device.type == "cuda" else None
+
         if precision == Precision.FP16:
             # [INT-002] GradScaler only for non-FSDP2
             if self.distributed_strategy not in (
                 "fsdp", "fsdp2", "sota_fsdp",
-            ):
+            ) and amp_device == "cuda":
                 self.scaler = torch.amp.GradScaler(device="cuda")
-            return lambda: torch.amp.autocast(
-                'cuda', dtype=torch.float16,
-            )
+            if amp_device == "cuda":
+                return lambda: torch.amp.autocast(
+                    "cuda", dtype=torch.float16,
+                )
+            return lambda: nullcontext()
         elif precision == Precision.BF16:
-            return lambda: torch.amp.autocast(
-                'cuda', dtype=torch.bfloat16,
-            )
+            if amp_device == "cuda":
+                return lambda: torch.amp.autocast(
+                    "cuda", dtype=torch.bfloat16,
+                )
+            if self.device.type == "cpu":
+                return lambda: torch.amp.autocast(
+                    "cpu", dtype=torch.bfloat16,
+                )
+            return lambda: nullcontext()
         elif precision in (Precision.FP8_E4M3, Precision.FP8_E5M2):
-            return lambda: torch.amp.autocast(
-                'cuda', dtype=torch.bfloat16,
-            )
+            if amp_device == "cuda":
+                return lambda: torch.amp.autocast(
+                    "cuda", dtype=torch.bfloat16,
+                )
+            return lambda: nullcontext()
         else:
             return lambda: nullcontext()
 
@@ -2416,7 +2622,8 @@ class SOTATrainer:
         if self._fsdp2_engine._memory_pool is not None:
             self._fsdp2_engine._memory_pool.clear()
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # [INT-006] Delegate to FSDP2 checkpoint manager
         result = FSDPCheckpointManager.save_checkpoint(
@@ -2438,11 +2645,13 @@ class SOTATrainer:
                 f"FSDP2 checkpoint failed: {result.error}"
             )
             # [TFIX-001] Re-pin device on failure
-            torch.cuda.set_device(self.device)
+            if self.device.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.set_device(self.device)
             return
 
         # [TFIX-001] Re-pin device after FSDP2 save
-        torch.cuda.set_device(self.device)
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.set_device(self.device)
 
         # [TFIX-002] Save trainer state (NO optimizer — already saved)
         if self._fsdp2_engine.is_rank_zero:
@@ -2450,10 +2659,12 @@ class SOTATrainer:
 
         # [TFIX-004] Post-save cleanup
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # [TFIX-001] Final device re-pin
-        torch.cuda.set_device(self.device)
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.set_device(self.device)
 
         elapsed = time.monotonic() - save_start
         log_rank_0(
@@ -2476,15 +2687,19 @@ class SOTATrainer:
                 if hasattr(self.model, 'module')
                 else self.model
             )
-            torch.save(model_to_save.state_dict(), stage_path)
+            model_state = self._state_dict_to_cpu(
+                model_to_save.state_dict(),
+            )
+            torch.save(model_state, stage_path)
 
         if hasattr(self.model, "_optimizer"):
             opt_path = os.path.join(
                 path, f"stage_{rank}_optimizer.pt",
             )
-            torch.save(
-                self.model._optimizer.state_dict(), opt_path,
+            opt_state = self._state_dict_to_cpu(
+                self.model._optimizer.state_dict(),
             )
+            torch.save(opt_state, opt_path)
 
         if rank == 0:
             self._save_trainer_state(path)
@@ -2516,7 +2731,12 @@ class SOTATrainer:
     
 
 
-    def _save_trainer_state(self, path: str) -> None:
+    def _save_trainer_state(
+        self,
+        path: str,
+        include_optimizer: bool = True,
+        include_scaler: bool = True,
+    ) -> None:
         """
         Save trainer state (optimizer, scheduler, RNG).
 
@@ -2540,7 +2760,7 @@ class SOTATrainer:
         """
         # ── Optimizer state → CPU ──
         opt_state = None
-        if self.optimizer is not None:
+        if include_optimizer and self.optimizer is not None:
             opt_state = self.optimizer.state_dict()
             # [TFIX-001] Recursively move ALL tensors to CPU
             opt_state = self._state_dict_to_cpu(opt_state)
@@ -2577,7 +2797,7 @@ class SOTATrainer:
 
         # ── Scaler state (non-FSDP2 fp16 only) ──
         scaler_state = None
-        if self.scaler is not None:
+        if include_scaler and self.scaler is not None:
             try:
                 scaler_state = self.scaler.state_dict()
             except Exception:
@@ -2623,6 +2843,19 @@ class SOTATrainer:
                     pass
             logger.error(f"Failed to save trainer state: {e}")
             raise
+
+    def _save_trainer_state_fsdp2(self, path: str) -> None:
+        """
+        Save trainer-owned state for FSDP2 checkpoints.
+
+        Optimizer shards are already saved by FSDPCheckpointManager, so the
+        trainer intentionally skips optimizer/scaler serialization here.
+        """
+        self._save_trainer_state(
+            path,
+            include_optimizer=False,
+            include_scaler=False,
+        )
 
     @staticmethod
     def _state_dict_to_cpu(state: Any) -> Any:
@@ -2916,34 +3149,7 @@ class SOTATrainer:
 
         # ── FSDP2 [INT-006] ──
         if self._is_fsdp2_active:
-            log_rank_0(f"Saving FSDP2 checkpoint to {path}")
-
-            result = FSDPCheckpointManager.save_checkpoint(
-                fsdp=self._fsdp2_engine,
-                optimizer=self.optimizer,
-                path=path,
-                epoch=self.state.epoch,
-                step=self.state.global_step,
-                extra_state={
-                    "best_metric": self.state.best_metric,
-                    "patience_counter": self.state.patience_counter,
-                    "samples_seen": self.state.samples_seen,
-                    "total_loss": self.state.total_loss,
-                },
-                sharded=True,
-            )
-
-            if result.is_err():
-                logger.error(
-                    f"FSDP2 checkpoint save failed: {result.error}"
-                )
-            else:
-                log_rank_0(f"FSDP2 checkpoint saved: {path}")
-
-            # Trainer state saved by rank 0 only
-            if self._fsdp2_engine.is_rank_zero:
-                self._save_trainer_state(path)
-
+            self._save_fsdp2_checkpoint(path)
             return
 
         # ── Raw FSDP guard ──

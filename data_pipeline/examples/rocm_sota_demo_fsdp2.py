@@ -158,27 +158,29 @@ class SOTADemo:
 
         log_rank_0("✅ Config: Strategy check passed")
         
-        # Override for verification (CPU / Tiny Model)
+        # Override for verification: always use tiny model + conservative kernels.
         if self.dist_state.world_size == 1:
-            log_rank_0("   Modes: Single-Process Verification (Mocking FSDP2 environment)...")
-            
-            # Use tiny model
-            log_rank_0("   Using tiny random model for verification...")
-            self.config.model["name_or_path"] = "HuggingFaceM4/tiny-random-LlamaForCausalLM"
-            self.config.model["torch_dtype"] = "float32"
-            self.config.quantization = self.config.raw.setdefault("quantization", {})
-            self.config.quantization["enabled"] = False
-            
-            # Fix: fsdp_config interaction
-            fsdp_cfg = self.config.distributed.get("fsdp_config", {})
-            if isinstance(fsdp_cfg, dict):
-                 fsdp_cfg["use_triton_kernels"] = False
-                 self.config.distributed["fsdp_config"] = fsdp_cfg
-            
-            # Force device to CPU if no GPU
-            if not torch.cuda.is_available():
-                self.config.raw.setdefault("hardware", {})["device"] = "cpu"
-                log_rank_0("   ⚠️ CUDA not available, falling back to CPU for verification.")
+            log_rank_0("   Modes: Single-Process Verification...")
+        else:
+            log_rank_0("   Modes: Multi-Process Verification...")
+
+        log_rank_0("   Using tiny random model for verification...")
+        self.config.model["name_or_path"] = "HuggingFaceM4/tiny-random-LlamaForCausalLM"
+        self.config.model["torch_dtype"] = "float32"
+        self.config.quantization = self.config.raw.setdefault("quantization", {})
+        self.config.quantization["enabled"] = False
+
+        # Keep verification deterministic/stable.
+        fsdp_cfg = self.config.distributed.get("fsdp_config", {})
+        if isinstance(fsdp_cfg, dict):
+            fsdp_cfg["use_triton_kernels"] = False
+            fsdp_cfg["activation_checkpointing"] = False
+            self.config.distributed["fsdp_config"] = fsdp_cfg
+
+        # Force device to CPU if no GPU.
+        if not torch.cuda.is_available():
+            self.config.raw.setdefault("hardware", {})["device"] = "cpu"
+            log_rank_0("   ⚠️ CUDA not available, falling back to CPU for verification.")
 
         # 2. Model Setup
         log_rank_0("   Setting up model...")

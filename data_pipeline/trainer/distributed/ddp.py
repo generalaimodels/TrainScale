@@ -817,8 +817,8 @@ class GradientCompressionHook(ABC):
 
     @abstractmethod
     def __call__(
-        self, state: Any, bucket: dist.GradBucket,
-    ) -> torch.futures.Future[Tensor]:
+        self, state: Any, bucket,
+    ):
         ...
 
     def _ensure_device(self, tensor: Tensor) -> None:
@@ -897,8 +897,8 @@ class FP16CompressionHook(GradientCompressionHook):
         return self._compress_buffers[numel]
 
     def __call__(
-        self, state: Any, bucket: dist.GradBucket,
-    ) -> torch.futures.Future[Tensor]:
+        self, state: Any, bucket,
+    ):
         tensor = bucket.buffer()
         self._ensure_device(tensor)
 
@@ -978,8 +978,8 @@ class BF16CompressionHook(GradientCompressionHook):
         return self._compress_buffers[numel]
 
     def __call__(
-        self, state: Any, bucket: dist.GradBucket,
-    ) -> torch.futures.Future[Tensor]:
+        self, state: Any, bucket,
+    ):
         tensor = bucket.buffer()
         self._ensure_device(tensor)
 
@@ -1080,8 +1080,8 @@ class PowerSGDHook(GradientCompressionHook):
             col.div_(norm.clamp(min=1e-8))
 
     def __call__(
-        self, state: Any, bucket: dist.GradBucket,
-    ) -> torch.futures.Future[Tensor]:
+        self, state: Any, bucket,
+    ):
         self._step += 1
         tensor = bucket.buffer()
         self._ensure_device(tensor)
@@ -1229,8 +1229,8 @@ class TopKSparsificationHook(GradientCompressionHook):
         self._error_dict: Dict[int, Tensor] = {}
 
     def __call__(
-        self, state: Any, bucket: dist.GradBucket,
-    ) -> torch.futures.Future[Tensor]:
+        self, state: Any, bucket,
+    ):
         tensor = bucket.buffer()
         self._ensure_device(tensor)
         bucket_idx = bucket.index()
@@ -1350,7 +1350,7 @@ class HierarchicalAllReduceManager:
         global_ws = dist.get_world_size(self._global_group)
         metrics = self._metrics
 
-        def _hook(state: Any, bucket: dist.GradBucket) -> torch.futures.Future[Tensor]:
+        def _hook(state: Any, bucket):
             tensor = bucket.buffer()
 
             # Phase 1: Intra-node allreduce (NVLink / Infinity Fabric)

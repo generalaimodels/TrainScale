@@ -161,23 +161,29 @@ class SOTADemo:
             raise ValueError(f"❌ Strategy check failed: expected 'pipeline_zbpp', got '{self.config.distributed.get('strategy')}'")
         log_rank_0("✅ Config: Strategy is 'pipeline_zbpp'")
         
-        # Override for single-process verification
+        # Verification overrides: tiny model + stage/microbatch safety.
         if self.dist_state.world_size == 1:
-            log_rank_0("   Forcing num_pipeline_stages=1 for single-process verification...")
-            self.config.distributed["num_pipeline_stages"] = 1
-            self.config.distributed["num_microbatches"] = 4 # Needs to be > stages usually, or just 1 check
+            log_rank_0("   Modes: Single-Process Verification...")
+        else:
+            log_rank_0("   Modes: Multi-Process Verification...")
 
-        # Override for single-process verification
-        if self.dist_state.world_size == 1:
-            log_rank_0("   Forcing num_pipeline_stages=1 for single-process verification...")
-            self.config.distributed["num_pipeline_stages"] = 1
-            self.config.distributed["num_microbatches"] = 4
-            
-            # Use tiny model for verification to avoid huge download
-            log_rank_0("   Using tiny random model for verification...")
-            self.config.model["name_or_path"] = "HuggingFaceM4/tiny-random-LlamaForCausalLM"
-            self.config.model["torch_dtype"] = "float32" # Tiny model safe
-            self.config.quantization["enabled"] = False # Ensure quantization is off for tiny model
+        log_rank_0("   Using tiny random model for verification...")
+        self.config.model["name_or_path"] = "HuggingFaceM4/tiny-random-LlamaForCausalLM"
+        self.config.model["torch_dtype"] = "float32"
+        self.config.quantization["enabled"] = False
+
+        # Tiny model has very few layers; keep pipeline stage count small.
+        safe_stages = 2
+        self.config.distributed["num_pipeline_stages"] = safe_stages
+        self.config.distributed["num_microbatches"] = max(
+            safe_stages,
+            int(self.config.distributed.get("num_microbatches", 4)),
+        )
+        log_rank_0(
+            f"   Verification stages/microbatches: "
+            f"{self.config.distributed['num_pipeline_stages']}/"
+            f"{self.config.distributed['num_microbatches']}"
+        )
             
         # We need to explicitly import these to check instance type
         from data_pipeline.trainer.distributed.zbpp import ZeroBubblePipeline, ZBPPOptimizer
@@ -226,8 +232,8 @@ class SOTADemo:
         
         # 4. Training Loop Check
         log_rank_0("   Running 1 Step Training Loop...")
-        trainer.config.training["max_steps"] = 1
-        trainer.config.training["logging_steps"] = 1
+        trainer.config.training.max_steps = 1
+        trainer.config.training.logging_steps = 1
         trainer.train(dataloader)
         log_rank_0("✅ Training: 1 step completed successfully")
         
@@ -348,7 +354,7 @@ class SOTADemo:
         # Override config with CLI arguments
         if max_steps > 0:
             log_rank_0(f"Overriding max_steps: {max_steps}")
-            trainer.config.training["max_steps"] = max_steps
+            trainer.config.training.max_steps = max_steps
         
         # 3. Get Distributed DataLoader
         # For ZBPP, we fetch global batch, and trainer splits it into microbatches
