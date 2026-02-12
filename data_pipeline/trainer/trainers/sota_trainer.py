@@ -650,6 +650,7 @@ class SOTATrainer:
     def __init__(self, config: SOTAConfig):
         self.config = config
         self.state = TrainingState()
+        self._last_checkpoint_step: int = -1
 
         # Components (initialized lazily)
         self.model: Optional[nn.Module] = None
@@ -2096,7 +2097,8 @@ class SOTATrainer:
                             eval_metrics = self.evaluate(
                                 eval_dataloader, compute_metrics,
                             )
-                            logger.info(f"Eval: {eval_metrics}")
+                            if self._is_main_process:
+                                logger.info(f"Eval: {eval_metrics}")
                             if self._check_early_stopping(
                                 eval_metrics,
                             ):
@@ -2110,6 +2112,8 @@ class SOTATrainer:
                             train_cfg.save_strategy == "steps"
                             and self.state.global_step
                             % train_cfg.save_steps == 0
+                            and self._last_checkpoint_step
+                            != self.state.global_step
                         ):
                             self.save_checkpoint()
 
@@ -2245,7 +2249,8 @@ class SOTATrainer:
                         eval_metrics = self.evaluate(
                             eval_dataloader, compute_metrics,
                         )
-                        logger.info(f"Eval: {eval_metrics}")
+                        if self._is_main_process:
+                            logger.info(f"Eval: {eval_metrics}")
                         if self._check_early_stopping(
                             eval_metrics,
                         ):
@@ -2259,6 +2264,8 @@ class SOTATrainer:
                         train_cfg.save_strategy == "steps"
                         and self.state.global_step
                         % train_cfg.save_steps == 0
+                        and self._last_checkpoint_step
+                        != self.state.global_step
                     ):
                         self.save_checkpoint()
 
@@ -2292,7 +2299,8 @@ class SOTATrainer:
                     break
 
             if train_cfg.save_strategy == "epoch":
-                self.save_checkpoint()
+                if self._last_checkpoint_step != self.state.global_step:
+                    self.save_checkpoint()
 
         self._restore_best_model(train_cfg, metrics)
         return metrics
@@ -2522,24 +2530,27 @@ class SOTATrainer:
             self.state.best_metric = current_loss
             self.state.patience_counter = 0
 
+            best_path = os.path.join(
+                self.config.training.output_dir,
+                "checkpoint-best",
+            )
             if self._is_main_process:
-                best_path = os.path.join(
-                    self.config.training.output_dir,
-                    "checkpoint-best",
-                )
                 logger.info(
                     f"New best (Loss: {current_loss:.4f}). "
                     f"Saving: {best_path}"
                 )
-                self.save_checkpoint(path=best_path)
+            # All ranks must enter save_checkpoint() to satisfy
+            # distributed barriers inside save logic.
+            self.save_checkpoint(path=best_path)
             return False
 
         self.state.patience_counter += 1
-        logger.info(
-            f"⏳ Early Stop: "
-            f"{self.state.patience_counter}/{patience} "
-            f"(Best: {self.state.best_metric:.4f})"
-        )
+        if self._is_main_process:
+            logger.info(
+                f"⏳ Early Stop: "
+                f"{self.state.patience_counter}/{patience} "
+                f"(Best: {self.state.best_metric:.4f})"
+            )
         return self.state.patience_counter >= patience
 
     # ═════════════════════════════════════════════════════════════════════
@@ -3103,6 +3114,7 @@ class SOTATrainer:
                 self.config.training.output_dir,
                 f"checkpoint-{self.state.global_step}",
             )
+        checkpoint_step = self.state.global_step
 
         os.makedirs(path, exist_ok=True)
 
@@ -3138,6 +3150,7 @@ class SOTATrainer:
 
             if dist.is_initialized():
                 dist.barrier()
+            self._last_checkpoint_step = checkpoint_step
             return
 
         # ── Context Parallel — pre-save barrier ──
@@ -3150,6 +3163,7 @@ class SOTATrainer:
         # ── FSDP2 [INT-006] ──
         if self._is_fsdp2_active:
             self._save_fsdp2_checkpoint(path)
+            self._last_checkpoint_step = checkpoint_step
             return
 
         # ── Raw FSDP guard ──
@@ -3163,6 +3177,7 @@ class SOTATrainer:
             )
             if not dist.is_initialized() or dist.get_rank() == 0:
                 self._save_trainer_state(path)
+            self._last_checkpoint_step = checkpoint_step
             return
 
         # ── Standard DDP / Single GPU ──
@@ -3194,6 +3209,7 @@ class SOTATrainer:
         # Post-save barrier
         if dist.is_initialized():
             dist.barrier()
+        self._last_checkpoint_step = checkpoint_step
 
     def load_checkpoint(self, path: str) -> None:
         """
