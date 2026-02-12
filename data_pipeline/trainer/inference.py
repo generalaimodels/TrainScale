@@ -76,6 +76,14 @@ except ImportError as exc:
         "[FATAL] PyTorch not found. Install via: pip install torch"
     ) from exc
 
+# Ensure vLLM sees a concrete target device at import time.
+if torch.cuda.is_available():
+    os.environ.setdefault("VLLM_TARGET_DEVICE", "cuda")
+    os.environ.setdefault("VLLM_DEVICE", "cuda")
+else:
+    os.environ.setdefault("VLLM_TARGET_DEVICE", "cpu")
+    os.environ.setdefault("VLLM_DEVICE", "cpu")
+
 try:
     from vllm import LLM, SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
@@ -719,7 +727,10 @@ class HardwareProbe:
 
         for i in range(num_gpus):
             props = torch.cuda.get_device_properties(i)
-            mem_gb = props.total_mem / (1024 ** 3)
+            total_mem = getattr(props, "total_memory", None)
+            if total_mem is None:
+                total_mem = getattr(props, "total_mem", 0)
+            mem_gb = float(total_mem) / (1024 ** 3)
             info["devices"].append({
                 "index": i,
                 "name": props.name,
@@ -918,6 +929,10 @@ class EngineBuilder:
         Returns Result[LLM] — never throws for configuration errors.
         """
         try:
+            os.environ.setdefault(
+                "VLLM_TARGET_DEVICE",
+                "cuda" if torch.cuda.is_available() else "cpu",
+            )
             kwargs = cls._build_common_kwargs(config)
             logger.info(
                 f"Building synchronous LLM engine: model={config.model}"
@@ -943,6 +958,10 @@ class EngineBuilder:
         Returns Result[AsyncLLMEngine].
         """
         try:
+            os.environ.setdefault(
+                "VLLM_TARGET_DEVICE",
+                "cuda" if torch.cuda.is_available() else "cpu",
+            )
             kwargs = cls._build_common_kwargs(config)
             logger.info(
                 f"Building async LLM engine: model={config.model}"

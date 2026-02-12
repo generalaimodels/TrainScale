@@ -2052,7 +2052,8 @@ class SOTATrainer:
                         self.optimizer.zero_grad(set_to_none=True)
                         continue
 
-                    loss_for_backward = loss / grad_accum
+                    # FSDP2 engine handles grad-accum scaling internally.
+                    loss_for_backward = loss
 
                     # [INT-003] Delegate backward to engine
                     is_sync_step = self._fsdp2_engine.backward(
@@ -2417,12 +2418,33 @@ class SOTATrainer:
         metrics: Dict[str, float],
     ) -> None:
         """Restore best model if checkpoint exists."""
+        if self._is_fsdp2_active and dist.is_initialized():
+            if self._is_main_process:
+                logger.info(
+                    "Skipping best-model restore for distributed FSDP2 run."
+                )
+            return
+
+        if dist.is_initialized():
+            # Ensure all ranks have finished any preceding checkpoint writes.
+            dist.barrier()
+
         best_path = os.path.join(
             train_cfg.output_dir, "checkpoint-best",
         )
         if os.path.exists(best_path):
             logger.info(f"Restoring best model: {best_path}")
-            self.load_checkpoint(best_path)
+            try:
+                self.load_checkpoint(best_path)
+            except BaseException as e:
+                if self._is_fsdp2_active:
+                    if self._is_main_process:
+                        logger.warning(
+                            "Skipping FSDP2 best-model restore due to load "
+                            f"failure: {e}"
+                        )
+                    return
+                raise
             metrics["best_metric"] = self.state.best_metric
 
     def _training_step(
@@ -3410,7 +3432,11 @@ class SOTATrainer:
         # ── FSDP2: materialize full params ──
         if self._is_fsdp2_active:
             log_rank_0("Gathering full parameters for export...")
-            export_model = self.model
+            export_model = (
+                self.model.module
+                if hasattr(self.model, "module")
+                else self.model
+            )
             export_context = self._fsdp2_engine.summon_full_params(
                 writeback=False,
             )
@@ -3441,6 +3467,11 @@ class SOTATrainer:
             if is_main:
                 if export_cfg.format == ExportFormat.SAFETENSORS:
                     save_safetensors(export_model, output_dir)
+                    if (
+                        tokenizer is not None
+                        and hasattr(tokenizer, "save_pretrained")
+                    ):
+                        tokenizer.save_pretrained(output_dir)
                     log_rank_0(
                         f"SafeTensors exported: {output_dir}"
                     )

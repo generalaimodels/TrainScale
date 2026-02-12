@@ -1035,10 +1035,20 @@ def auto_patch_layernorm(module: nn.Module) -> None:
     from data_pipeline.trainer.kernels.triton_kernels import fast_rms_layernorm
     
     original_forward = module.forward
-    weight = module.weight
     eps = getattr(module, 'eps', getattr(module, 'variance_epsilon', 1e-6))
     
     def patched_forward(hidden_states):
+        # Use live weight each call (can change device after patching),
+        # and gracefully fall back for non-CUDA tensors.
+        weight = getattr(module, "weight", None)
+        if (
+            not isinstance(hidden_states, torch.Tensor)
+            or weight is None
+            or not isinstance(weight, torch.Tensor)
+            or not hidden_states.is_cuda
+            or not weight.is_cuda
+        ):
+            return original_forward(hidden_states)
         return fast_rms_layernorm(hidden_states, weight, eps)
     
     module.forward = patched_forward

@@ -1045,11 +1045,8 @@ class GradientAccumulator:
         self._use_triton = use_triton and TRITON_AVAILABLE
         self._block_size = block_size
         self._grad_buffers: Dict[str, Tensor] = {}
-        for name, param in model.named_parameters():
-            if param.requires_grad:
-                self._grad_buffers[name] = torch.zeros_like(
-                    param, memory_format=torch.contiguous_format,
-                )
+        # Lazy allocation on first observed grad keeps buffer device/dtype
+        # aligned with actual backward tensors (avoids cpu/cuda mismatch).
 
     @property
     def should_sync(self) -> bool:
@@ -1064,18 +1061,29 @@ class GradientAccumulator:
         for name, param in model.named_parameters():
             if param.grad is None:
                 continue
-            if name not in self._grad_buffers:
-                self._grad_buffers[name] = torch.zeros_like(
-                    param.grad, memory_format=torch.contiguous_format,
-                )
-            buffer = self._grad_buffers[name]
             grad = param.grad.detach()
-            if buffer.shape != grad.shape:
+            if name not in self._grad_buffers:
                 self._grad_buffers[name] = torch.zeros_like(
                     grad, memory_format=torch.contiguous_format,
                 )
                 buffer = self._grad_buffers[name]
-            if self._use_triton and grad.numel() >= self._block_size:
+            else:
+                buffer = self._grad_buffers[name]
+            if (
+                buffer.shape != grad.shape
+                or buffer.device != grad.device
+                or buffer.dtype != grad.dtype
+            ):
+                self._grad_buffers[name] = torch.zeros_like(
+                    grad, memory_format=torch.contiguous_format,
+                )
+                buffer = self._grad_buffers[name]
+            if (
+                self._use_triton
+                and grad.is_cuda
+                and buffer.is_cuda
+                and grad.numel() >= self._block_size
+            ):
                 grid = (triton.cdiv(grad.numel(), self._block_size),)
                 _fused_gradient_accumulate_kernel[grid](
                     grad.contiguous(),
@@ -1092,7 +1100,10 @@ class GradientAccumulator:
             if not param.requires_grad:
                 continue
             if name in self._grad_buffers:
-                param.grad = self._grad_buffers[name]
+                buffer = self._grad_buffers[name]
+                if buffer.device != param.device:
+                    buffer = buffer.to(param.device)
+                param.grad = buffer
 
     def reset(self) -> None:
         self._current_step = 0
@@ -1586,16 +1597,12 @@ class SOTAFSDP2:
             / (1 << 30)
         )
 
-        # Gradient accumulator (AFTER FSDP wrapping for correct names)
+        # Gradient accumulation state (native FSDP no_sync path)
         if self._config.gradient_accumulation_steps > 1:
-            self._gradient_accumulator = GradientAccumulator(
-                wrapped_model,
-                self._config.gradient_accumulation_steps,
-                use_triton=(
-                    self._config.use_triton_kernels and TRITON_AVAILABLE
-                ),
-                block_size=self._config.triton_block_size,
-            )
+            # Use native autograd accumulation across micro-steps with
+            # no_sync(). Manual param.grad injection is unsafe with sharded
+            # parameters (e.g., local empty shards under FSDP2).
+            self._gradient_accumulator = None
             self._accumulation_counter = 0
 
         if self._is_rank_zero:
@@ -1663,10 +1670,7 @@ class SOTAFSDP2:
         Returns:
             True when sync step reached (caller should call step()).
         """
-        has_accumulator = (
-            self._gradient_accumulator is not None
-            and self._config.gradient_accumulation_steps > 1
-        )
+        has_accumulator = self._config.gradient_accumulation_steps > 1
 
         if has_accumulator:
             self._accumulation_counter += 1
@@ -1674,24 +1678,21 @@ class SOTAFSDP2:
                 self._accumulation_counter
                 >= self._config.gradient_accumulation_steps
             )
+            scaled = loss / float(self._config.gradient_accumulation_steps)
 
             if is_sync_step:
                 # Sync step: allow FSDP reduce-scatter
-                scaled_loss = self._mp_context.scale_loss(loss)
+                scaled_loss = self._mp_context.scale_loss(scaled)
                 with self._metrics.measure_backward():
                     scaled_loss.backward(retain_graph=retain_graph)
-                self._gradient_accumulator.accumulate(self._wrapped_model)
                 self._metrics.update_memory_stats()
                 return True
             else:
                 # Non-sync: suppress reduce-scatter [FIX-003]
                 with self._no_sync_context():
-                    scaled_loss = self._mp_context.scale_loss(loss)
+                    scaled_loss = self._mp_context.scale_loss(scaled)
                     with self._metrics.measure_backward():
                         scaled_loss.backward(retain_graph=retain_graph)
-                    self._gradient_accumulator.accumulate(
-                        self._wrapped_model,
-                    )
                 self._metrics.update_memory_stats()
                 return False
         else:
@@ -1717,10 +1718,6 @@ class SOTAFSDP2:
         [INT-004] Trainer calls THIS, never optimizer.step().
         Call ONLY when backward() returns True.
         """
-        # Apply accumulated gradients
-        if self._gradient_accumulator is not None:
-            self._gradient_accumulator.apply_to_model(self._wrapped_model)
-
         # Unscale (fp16 only) — at sync step
         self._mp_context.unscale_grads(optimizer)
 
@@ -1742,9 +1739,8 @@ class SOTAFSDP2:
         # Zero gradients
         optimizer.zero_grad(set_to_none=True)
 
-        # Reset accumulator
-        if self._gradient_accumulator is not None:
-            self._gradient_accumulator.reset()
+        # Reset micro-step counter
+        if self._config.gradient_accumulation_steps > 1:
             self._accumulation_counter = 0
 
         # Record metrics
@@ -2659,7 +2655,7 @@ class FSDPCheckpointManager:
 
             return result
 
-        except Exception as e:
+        except BaseException as e:
             logger.error(
                 f"Checkpoint load failed on rank {fsdp.rank}: {e}"
             )

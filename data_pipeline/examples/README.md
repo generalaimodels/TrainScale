@@ -93,3 +93,46 @@ torchrun --nproc_per_node=4 \
   --config data_pipeline/examples/zbpp_sota_config.yaml \
   > /tmp/trainscale_example_logs/zbpp.log 2>&1
 ```
+
+## 6. `inference.py` typed API reference
+
+File: `data_pipeline/trainer/inference.py`
+
+Enums:
+- `ResultStatus`
+- `QuantizationMethod`
+- `ParallelStrategy`
+- `SchedulerPolicy`
+- `AttentionBackend`
+
+Core typed result/response:
+- `Result[T]`
+- `RequestMetrics`
+- `InferenceRequest`
+- `InferenceResponse`
+- `StreamChunk`
+
+Config dataclasses:
+- `QuantizationConfig`
+- `ParallelConfig`
+- `SchedulerConfig`
+- `SpeculativeConfig`
+- `CacheConfig`
+- `LoRAConfig`
+- `ObservabilityConfig`
+- `EngineConfig`
+- `GenerationParams`
+
+Engine/runtime classes:
+- `MetricsAggregator`
+- `HardwareProbe`
+- `EngineBuilder`
+- `SOTAInferenceEngine`
+- `SOTAAsyncStreamEngine`
+- `EnginePresets`
+
+Top-level API helpers:
+- `create_openai_server(...)`
+- `run_batch_demo(...)`
+- `run_benchmark(...)`
+- `run_hardware_probe(...)`

@@ -149,6 +149,26 @@ def save_safetensors(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
+    # Prefer HF-native save_pretrained when available so exported
+    # directory includes config + safetensors shards for inference load.
+    if hasattr(model, "save_pretrained"):
+        try:
+            model.save_pretrained(
+                str(output_path),
+                safe_serialization=True,
+                max_shard_size=max_shard_size,
+            )
+            files = sorted(
+                str(p) for p in output_path.glob("*.safetensors")
+            )
+            print(
+                f"✓ Saved {len(files)} safetensors shards to {output_dir}"
+            )
+            return files
+        except Exception:
+            # Fall through to manual tensor-only saver.
+            pass
+
     state_dict = model.state_dict()
     
     # Convert to float16 for efficient storage

@@ -195,12 +195,107 @@ class SOTADemo:
         log_rank_0("Export complete.")
 
     def _run_inference(self, model_path: str):
-        """Run sample inference on the exported model."""
+        """
+        Run sample inference on the exported model.
+
+        Strategy:
+          1) Try TrainScale SOTA inference engine (data_pipeline/trainer/inference.py)
+          2) Fallback to plain Transformers generation on error/unavailability
+        """
         log_rank_0(f"🚀 Running Inference Benchmark on {model_path}...")
-        
+
+        prompts = [
+            "User: What is the capital of France?\nAssistant:",
+            "User: Write a python function to compute Fibonacci numbers.\nAssistant:",
+        ]
+
+        if self._run_inference_sota_engine(model_path, prompts):
+            return
+
+        log_rank_0(
+            "⚠️ SOTA inference engine unavailable/failed; "
+            "falling back to Transformers inference."
+        )
+        self._run_inference_transformers(model_path, prompts)
+
+    def _run_inference_sota_engine(
+        self,
+        model_path: str,
+        prompts: List[str],
+    ) -> bool:
+        """Try inference using data_pipeline.trainer.inference.py."""
+        if not os.path.exists(model_path):
+            logger.warning(
+                f"SOTA inference skipped: model path not found: {model_path}"
+            )
+            return False
+
         try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer, TextStreamer
-            
+            from data_pipeline.trainer import inference as sota_inference
+        except BaseException as e:
+            logger.warning(
+                "Could not import TrainScale inference module "
+                f"(likely missing vLLM/runtime deps): {e}"
+            )
+            return False
+
+        try:
+            dtype = "bfloat16" if torch.cuda.is_available() else "float32"
+            engine_config = sota_inference.EngineConfig(
+                model=model_path,
+                tokenizer=model_path,
+                dtype=dtype,
+                trust_remote_code=True,
+                enforce_eager=True,
+            )
+            engine = sota_inference.SOTAInferenceEngine(engine_config)
+            gen_params = sota_inference.GenerationParams(
+                max_tokens=100,
+                temperature=0.7,
+                top_p=0.95,
+            )
+
+            result = engine.generate(prompts, params=gen_params)
+            if result.is_err():
+                logger.warning(
+                    f"SOTA inference generation failed: {result.error}"
+                )
+                return False
+
+            responses = result.unwrap()
+            if not responses:
+                logger.warning("SOTA inference returned no responses.")
+                return False
+
+            for prompt, response in zip(prompts, responses):
+                log_rank_0(f"\nExample Prompt: {prompt}")
+                log_rank_0(f"Response:\n{response.generated_text}")
+                log_rank_0("-" * 40)
+
+            try:
+                metrics = engine.get_metrics_summary()
+                log_rank_0(f"SOTA inference metrics: {metrics}")
+            except Exception as metrics_err:
+                logger.warning(
+                    f"Failed to collect inference metrics: {metrics_err}"
+                )
+
+            return True
+
+        except Exception as e:
+            logger.warning(f"SOTA inference path failed: {e}")
+            logger.debug("SOTA inference traceback", exc_info=True)
+            return False
+
+    def _run_inference_transformers(
+        self,
+        model_path: str,
+        prompts: List[str],
+    ) -> None:
+        """Fallback inference using HuggingFace Transformers."""
+        try:
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
             # Load back for verification
             tokenizer = AutoTokenizer.from_pretrained(model_path)
             model = AutoModelForCausalLM.from_pretrained(
@@ -209,11 +304,6 @@ class SOTADemo:
                 device_map="cuda",
                 trust_remote_code=True
             )
-            
-            prompts = [
-                "User: What is the capital of France?\nAssistant:",
-                "User: Write a python function to compute Fibonacci numbers.\nAssistant:",
-            ]
             
             for prompt in prompts:
                 log_rank_0(f"\nExample Prompt: {prompt}")
@@ -231,9 +321,9 @@ class SOTADemo:
                 response = tokenizer.decode(outputs[0], skip_special_tokens=True)
                 log_rank_0(f"Response:\n{response}")
                 log_rank_0("-" * 40)
-                
+
         except Exception as e:
-            log_rank_0(f"❌ Inference failed: {e}")
+            log_rank_0(f"❌ Fallback inference failed: {e}")
 
     def run(self, max_steps: int = 100):
         """Run the demo."""
