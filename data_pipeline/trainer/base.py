@@ -454,7 +454,10 @@ class Trainer:
             return clip_grad_norm_(
                 self.model.parameters(),
                 max_norm,
-                error_if_nonfinite=True,
+                # Do not raise on non-finite gradients; let the trainer
+                # handle overflow by skipping the optimizer step and
+                # updating the overflow counter in a controlled way.
+                error_if_nonfinite=False,
             )
         
         return None
@@ -496,6 +499,9 @@ class Trainer:
             total_steps = num_update_steps_per_epoch * self.args.num_epochs
             num_epochs = self.args.num_epochs
         
+        # Update immutable training state with total planned steps.
+        self.state = self.state.with_update(total_steps=total_steps)
+        
         # Create optimizer and scheduler if not provided
         if self.optimizer is None:
             self.optimizer = self._create_optimizer()
@@ -506,6 +512,14 @@ class Trainer:
         if self.args.seed is not None:
             torch.manual_seed(self.args.seed)
             random.seed(self.args.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.args.seed)
+            # NumPy seeding is best-effort to keep dependency optional.
+            try:
+                import numpy as np  # type: ignore
+                np.random.seed(self.args.seed)
+            except Exception:
+                pass
         
         # Initialize callback context
         self._ctx = CallbackContext(
@@ -588,20 +602,60 @@ class Trainer:
             
             # Accumulation check
             if (step + 1) % accum_steps == 0:
-                # Gradient clipping
+                # Gradient clipping and health diagnostics
                 grad_info = self._maybe_clip_gradients()
-                
-                # Optimizer step
-                self._optimizer_step()
-                
-                self.global_step += 1
-                self._total_loss += loss
-                
-                # Update context
+                overflow = bool(grad_info and grad_info.overflow)
+
+                if not overflow:
+                    # Optimizer + scheduler step only when gradients are finite.
+                    self._optimizer_step()
+                    self.global_step += 1
+                    self._total_loss += loss
+                else:
+                    # On overflow, skip parameter update but still advance scaler
+                    # to allow it to reduce the internal scale factor.
+                    if self.scaler is not None:
+                        self.scaler.update()
+                    if self.optimizer is not None:
+                        self.optimizer.zero_grad()
+                    self.state = self.state.with_update(
+                        overflow_count=self.state.overflow_count + 1
+                    )
+
+                # Update numerical diagnostics and expose them via callback context.
+                if grad_info is not None:
+                    self.state = self.state.with_update(
+                        grad_norm=grad_info.global_norm,
+                    )
+                    self._ctx.metrics["grad_norm"] = grad_info.global_norm
+                    self._ctx.metrics["grad_clipped"] = float(grad_info.clipped)
+                    self._ctx.metrics["grad_overflow"] = float(grad_info.overflow)
+
+                # Learning rate tracking (after scheduler step when applicable).
+                if self.scheduler is not None:
+                    current_lr = self.scheduler.get_last_lr()[0]
+                elif self.optimizer is not None and self.optimizer.param_groups:
+                    current_lr = self.optimizer.param_groups[0]["lr"]
+                else:
+                    current_lr = 0.0
+
+                # Update immutable training state with smoothed loss and LR.
+                self.state = self.state.with_update(
+                    global_step=self.global_step,
+                    epoch_step=step,
+                    running_loss=(
+                        self.state.smoothing_factor * self.state.running_loss
+                        + (1.0 - self.state.smoothing_factor) * loss
+                    ),
+                    current_lr=current_lr,
+                )
+
+                # Update context for callbacks.
                 self._ctx.step = self.global_step
                 self._ctx.loss = loss
-                self._ctx.learning_rate = self.scheduler.get_lr()[0] if self.scheduler else 0.0
-                
+                self._ctx.learning_rate = current_lr
+                self._ctx.metrics["train_loss"] = loss
+
                 self.callback_handler.trigger("on_step_end", self._ctx)
                 
                 # Check max steps

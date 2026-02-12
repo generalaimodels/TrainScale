@@ -360,23 +360,26 @@ def main():
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "29500"
     
+    demo: Optional[SOTADemo] = None
     try:
         demo = SOTADemo(args.config)
         
         if args.verify:
             demo.verify_integration()
-            return
-
-        demo.run(max_steps=args.max_steps)
-        
-        if dist.is_initialized():
-            dist.destroy_process_group()
-            
+        else:
+            demo.run(max_steps=args.max_steps)
     except Exception as e:
         print(f"\n❌ Error: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
+    finally:
+        # Ensure all distributed resources are released to avoid
+        # ProcessGroup warnings when the script exits.
+        if demo is not None and hasattr(demo, "dist_state"):
+            demo.dist_state.shutdown()
+        elif dist.is_initialized():
+            dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
